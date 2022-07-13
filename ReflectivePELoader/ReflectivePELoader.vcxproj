@@ -24,6 +24,7 @@
     <ProjectGuid>{349c6bed-5267-4f21-bb59-5ddabcb53c12}</ProjectGuid>
     <RootNamespace>ReflectivePELoader</RootNamespace>
     <WindowsTargetPlatformVersion>10.0</WindowsTargetPlatformVersion>
+    <ProjectName>ReflectivePELoader</ProjectName>
   </PropertyGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.Default.props" />
   <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Debug|Win32'" Label="Configuration">

