@@ -224,11 +224,12 @@ char*** __p___argvHook() {
 		for (int i = 2; i < argc; i++) {
 			argv[i-1] = argv[i];
 		}
+		argv[argc - 1] = NULL; // replace last arg with NULL
 	}
 	LocalFree(lpCmdLine);
 
 	char*** ppargv = (char***)malloc(sizeof(char*));
-	ppargv = &argv;
+	*ppargv = argv;
 	return ppargv;
 }
 int* __p___argcHook() {
@@ -255,6 +256,7 @@ LPSTR GetCommandLineAHook() {
 		for (int i = 2; i < argc; i++) {
 			argv[i-1] = argv[i];
 		}
+		argv[argc - 1] = NULL; // replace last arg with NULL
 		argc--;
 	}
 
@@ -309,6 +311,7 @@ LPWSTR GetCommandLineWHook() {
 		for (int i = 2; i < argc; i++) {
 			argv[i-1] = argv[i];
 		}
+		argv[argc - 1] = NULL; // replace last arg with NULL
 		argc--;
 	}
 
