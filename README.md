@@ -2,6 +2,7 @@
 - Supports Native and .NET PE files
 - Load Native or .NET PE file hosted on web server
 - IAT Hook to common commandline functions to fix arguments
+- Set proper permissions on loaded sections
 
 ## Usage
 ```ps
