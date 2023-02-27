@@ -3,7 +3,7 @@
 - Load Native or .NET PE file hosted on web server
 - IAT Hook to common commandline functions to fix arguments
 - Set proper permissions on loaded sections
-- ETW patching
+- ETW and AMSI patching
 
 ## Usage
 ```ps
