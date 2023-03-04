@@ -16,11 +16,11 @@
     	rename("ReportEvent", "InteropServices_ReportEvent")	\
 		rename("or", "InteropServices_or") // rename for c# symbols to not overwrite C++ functions/symbols
 
-// TODO: support TLS callbacks
 // TODO: Module Stomping 
 // TODO: obfuscated syscalls for VirtualAlloc, CopyMemory, VirtualProtect, LoadLibrary, and VirtualFree ntdll functions
 // TODO: native ExitThread function exits out of current process, hook this and fix
-// TODO: manually and recursively load DLL dependencies without LoadLibrary
+// TODO: manually and recursively load DLL dependencies by reimplementing LoadLibrary
+// TODO: manually resolving symbols by reimplementing GetProcAddress
 // TODO: find argv/argc get functions for other native C++ compilers, 
 //		 tested: cl.exe (non-multithreaded) __p__argvcan't seem to set load native memory to RW without voilation, possibly because memory is too close together and not on seperate pages?
 //		 untested: __getmainargs, __getcmdln, Environment.GetCommandLineArgs, changing PRTL_USER_PROCESS_PARAMETERS of PEB
@@ -395,7 +395,7 @@ DWORD resolveImportAddressTable(LPVOID peImageBase, IMAGE_NT_HEADERS* ntHeader, 
 				// https://docs.microsoft.com/en-us/cpp/build/exporting-functions-from-a-dll-by-ordinal-rather-than-by-name?view=msvc-170
 				if (IMAGE_SNAP_BY_ORDINAL(originalThunk->u1.Ordinal)) {
 					if (resolve) {
-						// resolve function address
+						// resolve function address symbol
 						LPCSTR functionOrdinal = (LPCSTR)IMAGE_ORDINAL(thunk->u1.Ordinal);
 						thunk->u1.Function = (DWORD_PTR)GetProcAddress(library, functionOrdinal);
 
@@ -663,7 +663,7 @@ DWORD loadNative(char* peBuffer, int argc, char** argv) {
 	// set proper memory region protection
 	setProtect(peImageBase, ntHeader);
 
-	// run TLS Callbacks if any are included
+	// run TLS Callbacks if any are included, before entry point
 	runTLSCallbacks(peImageBase, ntHeader);
 
 	// get entry address
