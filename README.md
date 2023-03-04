@@ -4,6 +4,7 @@
 - IAT Hook to common commandline functions to fix arguments
 - Set proper permissions on loaded sections
 - ETW and AMSI patching
+- TLS Callback support
 
 ## Usage
 ```ps
