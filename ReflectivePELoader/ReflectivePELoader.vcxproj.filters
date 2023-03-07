@@ -15,7 +15,7 @@
     </Filter>
   </ItemGroup>
   <ItemGroup>
-    <ClCompile Include="ReflectivePELoader.cpp">
+    <ClCompile Include="ReflectThis.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
   </ItemGroup>

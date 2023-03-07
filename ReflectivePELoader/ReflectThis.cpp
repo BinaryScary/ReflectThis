@@ -20,7 +20,8 @@
 // TODO: obfuscated syscalls for VirtualAlloc, CopyMemory, VirtualProtect, LoadLibrary, and VirtualFree ntdll functions
 // TODO: native ExitThread function exits out of current process, hook this and fix
 // TODO: manually and recursively load DLL dependencies by reimplementing LoadLibrary
-// TODO: manually resolving symbols by reimplementing GetProcAddress
+// TODO: manually resolving symbols by reimplementing GetProcAddress (APIHashing)
+// TODO: shellcode implementation for injection purposes?
 // TODO: find argv/argc get functions for other native C++ compilers, 
 //		 tested: cl.exe (non-multithreaded) __p__argvcan't seem to set load native memory to RW without voilation, possibly because memory is too close together and not on seperate pages?
 //		 untested: __getmainargs, __getcmdln, Environment.GetCommandLineArgs, changing PRTL_USER_PROCESS_PARAMETERS of PEB
