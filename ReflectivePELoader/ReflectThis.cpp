@@ -351,14 +351,15 @@ LPWSTR GetCommandLineWHook() {
 
 // import libraries, add function addresses to IAT, and hook commandline functions for masqurading
 DWORD resolveImportAddressTable(LPVOID peImageBase, IMAGE_NT_HEADERS* ntHeader, bool resolve) {
-	// get import address table for current process
+	// get import directory table for current process
 	IMAGE_DATA_DIRECTORY importsDirectory = ntHeader->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT];
 	if (importsDirectory.VirtualAddress == 0) {
 		printf("[-] PE does not contain any imports");
 		return 0;
 	}
 
-	// get first import descriptor in IAT
+	// get first import descriptor in directory table
+	// one import descriptor for each module/library which contains an ILT, IAT, and name of module
 	PIMAGE_IMPORT_DESCRIPTOR importDescriptor = NULL;
 	importDescriptor = (PIMAGE_IMPORT_DESCRIPTOR)(importsDirectory.VirtualAddress + (DWORD_PTR)peImageBase);
 
@@ -369,6 +370,7 @@ DWORD resolveImportAddressTable(LPVOID peImageBase, IMAGE_NT_HEADERS* ntHeader, 
 	//	printf("[!] Error modifying memory page protection: %d\n",GetLastError());
 	//}
 
+	// enumerate import descriptors (Import Lookup Table(ILT), Import Address Table(IAT), Module Name)
 	LPCSTR libraryName = "";
 	HMODULE library = NULL;
 	while (importDescriptor->Name != NULL) {
@@ -380,15 +382,18 @@ DWORD resolveImportAddressTable(LPVOID peImageBase, IMAGE_NT_HEADERS* ntHeader, 
 			library = LoadLibraryA(libraryName);
 		}
 
-		// resolve/find all thunks(function addresses/ordinals) and write them to importDescriptor
+		// resolve/find all functions in Import Lookup Table and write them to Import Address Table
+		// Import Address/Lookup Tables are a collection of multiple thunks/function addresses
 		if (library) {
-			// get first thunk(function) for import dll in current process
 			PIMAGE_THUNK_DATA thunk = NULL, originalThunk = NULL;
-			thunk = (PIMAGE_THUNK_DATA)((DWORD_PTR)peImageBase + importDescriptor->FirstThunk);
-			// contains original RVA unchanged by resolving/loading (so function name and ordinals can be still be retrieved after resolve/load)
+
+			// get first thunk(function) of Import Lookup Table
 			originalThunk = (PIMAGE_THUNK_DATA)((DWORD_PTR)peImageBase + importDescriptor->OriginalFirstThunk); 
 
-			// loop over thunks in import descriptor
+			// get first thunk(function) of Import Address Table
+			thunk = (PIMAGE_THUNK_DATA)((DWORD_PTR)peImageBase + importDescriptor->FirstThunk);
+
+			// loop over thunks in Import Lookup Table
 			while (thunk->u1.AddressOfData != NULL && (int)thunk != 0x0000ffff) {
 				// check if function is exported in dll by ordinal or by name(address) and add to IAT
 				// if DLL compiled with export ordinals(.def file), PIMAGE_IMPORT_BY_NAME cannot be cast since the AddressOfData is set to (ordinal number & 0x80000000)
@@ -398,6 +403,7 @@ DWORD resolveImportAddressTable(LPVOID peImageBase, IMAGE_NT_HEADERS* ntHeader, 
 					if (resolve) {
 						// resolve function address symbol
 						LPCSTR functionOrdinal = (LPCSTR)IMAGE_ORDINAL(thunk->u1.Ordinal);
+						// write resolved address to Import Address Table
 						thunk->u1.Function = (DWORD_PTR)GetProcAddress(library, functionOrdinal);
 
 						// debugging print
@@ -427,7 +433,7 @@ DWORD resolveImportAddressTable(LPVOID peImageBase, IMAGE_NT_HEADERS* ntHeader, 
 							functionAddress = (DWORD_PTR)GetProcAddress(library, func_name);
 						}
 
-						// set function address in IAT
+						// set function address in Import Address Table
 						thunk->u1.Function = functionAddress;
 
 						// debugging print
