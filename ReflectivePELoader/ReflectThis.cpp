@@ -163,24 +163,21 @@ DWORD rebaseImage(LPVOID peImageBase, IMAGE_NT_HEADERS* ntHeader) {
 	DWORD_PTR relocationTable = relocations.VirtualAddress + (DWORD_PTR)peImageBase;
 
 	// rebase/patch each absolute address in relocation table .reloc in allocated memory (patching only needed if image is not written to perferred address)
-	DWORD relocationsProcessed = 0;
-	while (relocationsProcessed < relocations.Size) {
+	DWORD relocationAddress = 0;
+	while (relocationAddress < relocations.Size) {
 		// get relocation block header
-		PBASE_RELOCATION_BLOCK relocationBlock = (PBASE_RELOCATION_BLOCK)(relocationTable + relocationsProcessed);
+		PBASE_RELOCATION_BLOCK relocationBlock = (PBASE_RELOCATION_BLOCK)(relocationTable + relocationAddress);
 		// calculate number of entries in relocation block
 		DWORD relocationsCount = (relocationBlock->BlockSize - sizeof(BASE_RELOCATION_BLOCK)) / sizeof(BASE_RELOCATION_ENTRY);
 
 		// add size of block header
-		relocationsProcessed += sizeof(BASE_RELOCATION_BLOCK);
+		relocationAddress += sizeof(BASE_RELOCATION_BLOCK);
 		// get first entry in relocation block
-		PBASE_RELOCATION_ENTRY relocationEntries = (PBASE_RELOCATION_ENTRY)(relocationTable + relocationsProcessed);
+		PBASE_RELOCATION_ENTRY relocationEntries = (PBASE_RELOCATION_ENTRY)(relocationTable + relocationAddress);
 		// patch each relocation entry
 		for (DWORD i = 0; i < relocationsCount; i++) {
 			// add size of entry
-			relocationsProcessed += sizeof(BASE_RELOCATION_ENTRY);
-
-		    // https://docs.microsoft.com/en-us/windows/win32/debug/pe-format#base-relocation-types
-			if (relocationEntries[i].Type == 0) continue; // this base relocation type is skipped
+			relocationAddress += sizeof(BASE_RELOCATION_ENTRY);
 
 			// read absolute address in relocation entry
 			DWORD_PTR relocationRVA = relocationBlock->PageAddress + relocationEntries[i].Offset;
@@ -193,8 +190,26 @@ DWORD rebaseImage(LPVOID peImageBase, IMAGE_NT_HEADERS* ntHeader) {
 			//DWORD oldProtect, protectRes;
 			//VirtualProtect((PVOID)((DWORD_PTR)peImageBase+relocationRVA), sizeof(DWORD_PTR), PAGE_READWRITE, &oldProtect);
 
-			// write/patch new absolute address back into relocation entry
-			memcpy((PVOID)((DWORD_PTR)peImageBase+relocationRVA), &addressToPatch, sizeof(DWORD_PTR));
+		    // https://docs.microsoft.com/en-us/windows/win32/debug/pe-format#base-relocation-types
+			DWORD_PTR baseOffset = (DWORD_PTR)peImageBase + relocationRVA;
+			if (relocationEntries[i].Type == IMAGE_REL_BASED_ABSOLUTE) {
+				continue; // this base relocation type is skipped
+			}else if (relocationEntries[i].Type == IMAGE_REL_BASED_DIR64) {
+				// write/patch new absolute address back into relocation entry
+				memcpy((PVOID)baseOffset, &addressToPatch, sizeof(DWORD_PTR));
+			}
+			else if (relocationEntries[i].Type == IMAGE_REL_BASED_HIGHLOW) {
+				// write/patch new absolute address back into relocation entry
+				memcpy((PVOID)baseOffset, &addressToPatch, sizeof(DWORD));
+			}
+			else if (relocationEntries[i].Type == IMAGE_REL_BASED_HIGH) {
+				// write/patch new absolute address back into relocation entry
+				memcpy((PVOID)(HIWORD(baseOffset)), &addressToPatch, sizeof(WORD));
+			}
+			else if (relocationEntries[i].Type == IMAGE_REL_BASED_LOW) {
+				// write/patch new absolute address back into relocation entry
+				memcpy((PVOID)(LOWORD(baseOffset)), &addressToPatch, sizeof(WORD));
+			}
 
 			//// restore to previous memory protection
 			//VirtualProtect((PVOID)((DWORD_PTR)peImageBase+relocationRVA), sizeof(DWORD_PTR), oldProtect, &oldProtect);
@@ -546,6 +561,9 @@ DWORD setProtect(LPVOID peBuffer, IMAGE_NT_HEADERS* ntHeader){
 		}
 	}
 
+	// flush instruction cache after memory modification
+	FlushInstructionCache((HANDLE)-1, NULL, 0);
+
 	return 0;
 }
 
@@ -668,7 +686,7 @@ DWORD loadNative(char* peBuffer, int argc, char** argv) {
 	}
 
 	// set proper memory region protection
-	setProtect(peImageBase, ntHeader);
+	setProtect(peImageBase, ntHeader); 
 
 	// run TLS Callbacks if any are included, before entry point
 	runTLSCallbacks(peImageBase, ntHeader);
