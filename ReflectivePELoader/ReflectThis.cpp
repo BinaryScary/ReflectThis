@@ -562,13 +562,13 @@ DWORD setProtect(LPVOID peBuffer, IMAGE_NT_HEADERS* ntHeader){
 	}
 
 	// flush instruction cache after memory modification
-	FlushInstructionCache((HANDLE)-1, NULL, 0);
+	FlushInstructionCache(GetCurrentProcess(), NULL, 0);
 
 	return 0;
 }
 
 // invokes Thread Local Storage callbacks
-DWORD runTLSCallbacks(LPVOID peBuffer, IMAGE_NT_HEADERS* ntHeader) {
+DWORD runTLSCallbacks(LPVOID peImageBase, IMAGE_NT_HEADERS* ntHeader) {
 	// get TLS directory
 	IMAGE_DATA_DIRECTORY tlsDir =  ntHeader->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_TLS];
 	if (tlsDir.VirtualAddress == 0) {
@@ -577,7 +577,7 @@ DWORD runTLSCallbacks(LPVOID peBuffer, IMAGE_NT_HEADERS* ntHeader) {
 	}
 
 	// get address of TLS directory in image and address of callbacks function address array
-	PIMAGE_TLS_DIRECTORY tlsAddress = (PIMAGE_TLS_DIRECTORY)(tlsDir.VirtualAddress + (DWORD)peBuffer);
+	PIMAGE_TLS_DIRECTORY tlsAddress = (PIMAGE_TLS_DIRECTORY)(tlsDir.VirtualAddress + (DWORD)peImageBase);
     DWORD_PTR* callbacksPtr = (DWORD_PTR*) tlsAddress->AddressOfCallBacks;
 	if (callbacksPtr == 0) {
 		printf("[-] TLS directory does not contain address callbacks\n");
@@ -593,7 +593,7 @@ DWORD runTLSCallbacks(LPVOID peBuffer, IMAGE_NT_HEADERS* ntHeader) {
 		printf("[-] Calling TLS callback: %08x\n", callbackVA);
 		// assign function address to function pointer and invoke
         void(NTAPI * callbackFunc)(PVOID DllHandle, DWORD dwReason, PVOID) = (void(NTAPI*)(PVOID, DWORD, PVOID)) callbackVA;
-        callbackFunc(peBuffer, DLL_PROCESS_ATTACH, NULL);
+        callbackFunc(peImageBase, DLL_PROCESS_ATTACH, NULL);
 
         callbacksPtr++;
     }
@@ -619,6 +619,9 @@ DWORD loadNative(char* peBuffer, int argc, char** argv) {
 	// get preferred base address, usually always 0x40000000 in .exe PE files
 	LPVOID preferredAddr = (LPVOID)ntHeader->OptionalHeader.ImageBase;
 
+	// debug print
+	//printf("[-] current process base address: %p\n", GetModuleHandleA(NULL));
+
 	// unmap image base if it has been previously mapped
 	// only needed if ReflectiveLoader is loaded into a process twice?
 	// NtUnmapViewOfSection does not have a corresponding user-mode function
@@ -629,9 +632,15 @@ DWORD loadNative(char* peBuffer, int argc, char** argv) {
 	LPVOID peImageBase = VirtualAlloc(preferredAddr, imageSize, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
 
 	// if allocation not possible at preferred address, allocate anywhere
-	if (!peImageBase) {
-		peImageBase = VirtualAlloc(NULL, imageSize, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+	if (peImageBase) {
+		printf("[-] allocated memory at preferred address: %p\n", peImageBase);
 	}
+	else {
+		peImageBase = VirtualAlloc(NULL, imageSize, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+		printf("[-] could not allocate memory at preferred address: %p, new base address: %p\n", preferredAddr, peImageBase);
+	}
+
+	// if non-preferred allocation is not possible
 	if (!peImageBase) {
 		printf("[!] cannot allocate image base, memory capacity reached?\n");
 		return 1;
@@ -661,7 +670,7 @@ DWORD loadNative(char* peBuffer, int argc, char** argv) {
 	}
 
 	// reference headers from allocated memory so buffer can be free'd
-	ntHeader = getNT((char *)peImageBase);
+	ntHeader = getNT((char*)peImageBase);
 	if (ntHeader == NULL) {
 		return 1;
 	}
@@ -686,15 +695,26 @@ DWORD loadNative(char* peBuffer, int argc, char** argv) {
 	}
 
 	// set proper memory region protection
-	setProtect(peImageBase, ntHeader); 
+	setProtect(peImageBase, ntHeader);
 
 	// run TLS Callbacks if any are included, before entry point
 	runTLSCallbacks(peImageBase, ntHeader);
 
 	// get entry address
 	size_t entryAddr = (size_t)(peImageBase)+ntHeader->OptionalHeader.AddressOfEntryPoint;
-	// execute PE
-	((void(*)())entryAddr)();
+
+	// call entry function depending on if PE is DLL or EXE
+	BOOL peRet = FALSE;
+	if (ntHeader->FileHeader.Characteristics & IMAGE_FILE_DLL){
+		// execute DLL
+		BOOL(WINAPI * dllEntry)(HINSTANCE DllHandle, DWORD dwReason, LPVOID) = (BOOL(WINAPI*)(HINSTANCE, DWORD, LPVOID)) entryAddr;
+		dllEntry((HINSTANCE)peImageBase, DLL_PROCESS_ATTACH, 0);
+	}
+	else {
+		// execute EXE
+		int(*peMain)() = (int(*)())(entryAddr);
+		peRet = peMain();
+	}
 
 	// free memory
 	VirtualFree(peImageBase, imageSize, MEM_RELEASE);
