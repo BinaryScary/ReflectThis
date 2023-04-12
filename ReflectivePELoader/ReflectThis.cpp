@@ -561,9 +561,6 @@ DWORD setProtect(LPVOID peBuffer, IMAGE_NT_HEADERS* ntHeader){
 		}
 	}
 
-	// flush instruction cache after memory modification
-	FlushInstructionCache(GetCurrentProcess(), NULL, 0);
-
 	return 0;
 }
 
@@ -697,6 +694,9 @@ DWORD loadNative(char* peBuffer, int argc, char** argv) {
 	// set proper memory region protection
 	setProtect(peImageBase, ntHeader);
 
+	// flush instruction cache before execution in modified memory
+	FlushInstructionCache(GetCurrentProcess(), NULL, 0);
+
 	// run TLS Callbacks if any are included, before entry point
 	runTLSCallbacks(peImageBase, ntHeader);
 
@@ -709,6 +709,8 @@ DWORD loadNative(char* peBuffer, int argc, char** argv) {
 		// execute DLL
 		BOOL(WINAPI * dllEntry)(HINSTANCE DllHandle, DWORD dwReason, LPVOID) = (BOOL(WINAPI*)(HINSTANCE, DWORD, LPVOID)) entryAddr;
 		dllEntry((HINSTANCE)peImageBase, DLL_PROCESS_ATTACH, 0);
+
+		//Sleep(INFINITE); // needed if dll creates new thread
 	}
 	else {
 		// execute EXE
